@@ -1,0 +1,23 @@
+[package]
+name = "pitstop"
+version = "0.1.0"
+edition = "2021"
+description = "Linux tray app that tracks AI coding usage limits (Claude Code, OpenAI Codex) and switches accounts"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ksni = "0.3"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["clock"] }
+ab_glyph = "0.2"
+anyhow = "1"
+png = "0.17"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
