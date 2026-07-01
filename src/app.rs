@@ -201,7 +201,10 @@ impl Engine {
                 self.render().await;
             }
             Action::Remove { key } => {
-                if let Some(email) = key.strip_prefix("codex:") {
+                if let Some(email) = key.strip_prefix("gemini:") {
+                    let _ = self.gemini_store.remove(email);
+                    self.gemini_usage.remove(&key);
+                } else if let Some(email) = key.strip_prefix("codex:") {
                     let _ = self.codex_store.remove(email);
                     self.codex_usage.remove(&key);
                 } else {
@@ -630,6 +633,13 @@ impl Engine {
                 .map(|w| (w.label.clone(), w.used_percent, w.resets_at))
                 .collect();
         }
+        if let Some(gu) = self.gemini_usage.get(key) {
+            return gu
+                .windows
+                .iter()
+                .map(|w| (w.label.clone(), w.used_percent, w.resets_at))
+                .collect();
+        }
         if let Some(report) = self.usage.get(key) {
             let mut v: Vec<(String, f64, Option<DateTime<chrono::Utc>>)> = Vec::new();
             if let Some(u) = report.five_hour.and_then(|w| w.utilization) {
@@ -884,6 +894,11 @@ impl Engine {
                 removable.push((format!("{} · Codex", p.email), format!("codex:{}", p.email)));
             }
         }
+        for p in &self.gemini_store.profiles {
+            if Some(&p.email) != self.gemini_live_email.as_ref() {
+                removable.push((format!("{} · Gemini", p.email), format!("gemini:{}", p.email)));
+            }
+        }
 
         TrayView {
             icon,
@@ -920,12 +935,28 @@ impl Engine {
                 is_active: Some(&c.email) == self.codex_live_email.as_ref(),
             });
         }
+        for c in &self.gemini_store.profiles {
+            let plan = self.gemini_plan.get(&c.email).cloned().unwrap_or_else(|| c.plan_label.clone());
+            let plan_label = if plan.is_empty() {
+                gemini::SURFACE_TAG.to_string()
+            } else {
+                format!("{plan} · {}", gemini::SURFACE_TAG)
+            };
+            rows.push(MenuAccount {
+                email: c.email.clone(),
+                source: Source::Gemini,
+                plan_label,
+                is_active: Some(&c.email) == self.gemini_live_email.as_ref(),
+            });
+        }
         rows
     }
 
     fn headroom(&self, a: &MenuAccount) -> f64 {
         if a.is_codex() {
             self.codex_usage.get(&a.key()).map(|u| u.max_utilization()).unwrap_or(999.0)
+        } else if a.is_gemini() {
+            self.gemini_usage.get(&a.key()).map(|u| u.max_utilization()).unwrap_or(999.0)
         } else {
             self.usage.get(&a.email).map(|r| r.max_utilization()).unwrap_or(999.0)
         }
@@ -969,6 +1000,13 @@ impl Engine {
                 for w in &cu.windows {
                     let label = if w.label.is_empty() { "·" } else { &w.label };
                     detail.push(window_line(label, Some(w.used_percent), w.resets_at));
+                }
+            }
+        } else if account.is_gemini() {
+            if let Some(gu) = self.gemini_usage.get(&key) {
+                data_date = Some(gu.fetched_at);
+                for line in gemini_detail_lines(gu) {
+                    detail.push(line);
                 }
             }
         } else if let Some(report) = self.usage.get(&key) {
@@ -1138,7 +1176,23 @@ impl Engine {
         for acct in self.accounts_for_menu() {
             let marker = if acct.is_active { "●" } else { "○" };
             let key = acct.key();
-            let detail = if acct.is_codex() {
+            let detail = if acct.is_gemini() {
+                self.gemini_usage
+                    .get(&key)
+                    .map(|gu| {
+                        if gu.windows.is_empty() {
+                            "—".to_string()
+                        } else {
+                            gu.windows
+                                .iter()
+                                .map(|w| format!("{} {}", w.label, format::percent(Some(w.used_percent))))
+                                .collect::<Vec<_>>()
+                                .join(" · ")
+                        }
+                    })
+                    .or_else(|| self.fetch_error.get(&key).cloned())
+                    .unwrap_or_else(|| "…".into())
+            } else if acct.is_codex() {
                 self.codex_usage
                     .get(&key)
                     .map(|cu| {
@@ -1167,7 +1221,13 @@ impl Engine {
                     .or_else(|| self.fetch_error.get(&key).cloned())
                     .unwrap_or_else(|| "…".into())
             };
-            let provider = if acct.is_codex() { " (Codex)" } else { "" };
+            let provider = if acct.is_codex() {
+                " (Codex)"
+            } else if acct.is_gemini() {
+                " (Gemini)"
+            } else {
+                ""
+            };
             lines.push(format!("{marker} {}{provider} — {detail}", acct.email));
         }
         if lines.is_empty() {
@@ -1289,6 +1349,21 @@ fn menu_label(key: &str) -> String {
     } else {
         key.to_string()
     }
+}
+
+/// Detail lines for a Gemini row: one `window_line` per model quota window,
+/// followed by an `extras_line` summarising the next-most-used models (mirrors
+/// the Codex/Claude detail layout). Never logs the tokens the usage came from.
+fn gemini_detail_lines(usage: &gemini::Usage) -> Vec<String> {
+    let mut lines: Vec<String> = usage
+        .windows
+        .iter()
+        .map(|w| window_line(&w.label, Some(w.used_percent), w.resets_at))
+        .collect();
+    if let Some(extras) = usage.extras_line() {
+        lines.push(format!("       {extras}"));
+    }
+    lines
 }
 
 fn window_line(label: &str, pct: Option<f64>, resets_at: Option<DateTime<chrono::Utc>>) -> String {
@@ -1682,6 +1757,21 @@ mod tests {
         assert_eq!(menu_label("me@x"), "me@x"); // Claude (bare email)
         assert_eq!(menu_label("codex:me@x"), "me@x (Codex)");
         assert_eq!(menu_label("gemini:me@x"), "me@x (Gemini)");
+    }
+
+    #[test]
+    fn gemini_detail_lines_include_windows_and_extras() {
+        let u = gemini::Usage {
+            windows: vec![
+                gemini::UsageWindow { label: "3-pro".into(), used_percent: 22.0, resets_at: None },
+                gemini::UsageWindow { label: "2.5-flash".into(), used_percent: 5.0, resets_at: None },
+            ],
+            fetched_at: chrono::Local::now(),
+        };
+        let lines = gemini_detail_lines(&u);
+        // one line per window + one extras line
+        assert_eq!(lines.len(), 3);
+        assert!(lines.last().unwrap().contains("2.5-flash 5%"));
     }
 
     #[test]
