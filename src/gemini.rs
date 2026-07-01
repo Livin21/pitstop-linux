@@ -26,8 +26,6 @@ pub const ANTIGRAVITY_CLIENT_ID: &str =
     "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 /// **[verify]** reverse-engineered; the spike confirms it refreshes/exchanges.
 pub const ANTIGRAVITY_CLIENT_SECRET: &str = "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";
-// SCOPES/PROVIDER/SURFACE_TAG are the provider surface consumed by Tasks 2-10.
-#[allow(dead_code)]
 pub const SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform \
 https://www.googleapis.com/auth/userinfo.email \
 https://www.googleapis.com/auth/userinfo.profile \
@@ -37,7 +35,6 @@ https://www.googleapis.com/auth/experimentsandconfigs";
 #[allow(dead_code)]
 pub const PROVIDER: &str = "gemini";
 /// The one surface on Linux; shown as the row's surface tag.
-#[allow(dead_code)]
 pub const SURFACE_TAG: &str = "Antigravity";
 
 pub struct Creds {
@@ -57,16 +54,13 @@ impl Creds {
 
 pub struct Refreshed {
     pub access_token: String,
-    #[allow(dead_code)] // written back to the blob in Task 2
     pub id_token: Option<String>,
-    #[allow(dead_code)] // written back to the blob in Task 2
     pub expires_at_ms: f64,
 }
 
 #[derive(Clone)]
 pub struct Usage {
     pub windows: Vec<UsageWindow>,
-    #[allow(dead_code)] // rendered on the tray row in Task 6
     pub fetched_at: DateTime<Local>,
 }
 
@@ -74,7 +68,6 @@ pub struct Usage {
 pub struct UsageWindow {
     pub label: String,
     pub used_percent: f64,
-    #[allow(dead_code)] // rendered as reset time on the tray row in Task 6
     pub resets_at: Option<DateTime<Utc>>,
 }
 
@@ -125,7 +118,6 @@ pub fn decode_go_keyring(raw: &str) -> Option<Vec<u8>> {
     STANDARD.decode(b64).ok()
 }
 
-#[allow(dead_code)] // used to write the refreshed blob back to the keyring (Task 2)
 pub fn encode_go_keyring(json: &[u8]) -> String {
     format!("{GO_KEYRING_PREFIX}{}", STANDARD.encode(json))
 }

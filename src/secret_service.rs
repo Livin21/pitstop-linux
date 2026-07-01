@@ -33,7 +33,6 @@ pub async fn get(service: &str, account: &str) -> Result<Option<String>> {
 /// Create-or-replace a go-keyring item (matched by attributes service+username),
 /// storing `value` verbatim (Antigravity's `go-keyring-base64:` string). Label
 /// `"<service>/<account>"` matches go-keyring's schema.
-#[allow(dead_code)] // wired up in Task 8 (switch write-back)
 pub async fn set(service: &str, account: &str, value: &str) -> Result<()> {
     let ss = SecretService::connect(EncryptionType::Dh).await?;
     let collection = ss.get_default_collection().await?;

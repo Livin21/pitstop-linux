@@ -173,11 +173,20 @@ impl Tray for PitStopTray {
         items.push(self.settings_submenu());
         items.push(disabled(format!("PitStop v{}", env!("CARGO_PKG_VERSION"))));
         if let Some(ref info) = v.update_info {
-            items.push(send_item(
-                format!("Update & Relaunch  (v{} available)", info.version),
-                true,
-                Action::UpdateAndRelaunch,
-            ));
+            if info.can_rebuild {
+                items.push(send_item(
+                    format!("Update & Relaunch  (v{} available)", info.version),
+                    true,
+                    Action::UpdateAndRelaunch,
+                ));
+            } else {
+                // Not a rebuildable source checkout — send them to the release page.
+                items.push(send_item(
+                    format!("Update available  (v{}) →", info.version),
+                    true,
+                    Action::OpenUrl(info.url.clone()),
+                ));
+            }
         }
         items.push(send_item("Quit PitStop".into(), true, Action::Quit));
         items

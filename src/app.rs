@@ -186,7 +186,7 @@ impl Engine {
                 } else if let Some(email) = key.strip_prefix("codex:") {
                     self.perform_codex_switch(email, false, None).await;
                 } else {
-                    self.perform_switch(&key.clone(), false, None).await;
+                    self.perform_switch(&key, false, None).await;
                 }
                 self.refresh_all().await;
                 self.render().await;
@@ -476,6 +476,12 @@ impl Engine {
         let live_blob = match GeminiStore::live_blob().await {
             Ok(b) => b,
             Err(e) => {
+                // Gemini not in use (no saved profiles): don't let a keyring-connect
+                // failure clobber real Claude/Codex errors — short-circuit quietly.
+                if self.gemini_store.profiles.is_empty() {
+                    self.gemini_live_email = None;
+                    return;
+                }
                 self.last_top_level_error = Some(e.to_string());
                 None
             }
@@ -487,7 +493,10 @@ impl Engine {
                     self.gemini_live_email = Some(email.clone());
                     let plan = self.gemini_plan.get(&email).cloned().unwrap_or_default();
                     if let Err(e) = self.gemini_store.snapshot(&email, blob, &plan) {
-                        self.last_top_level_error = Some(e.to_string());
+                        // Same guard: only surface a keyring error if Gemini is in use.
+                        if !self.gemini_store.profiles.is_empty() {
+                            self.last_top_level_error = Some(e.to_string());
+                        }
                     }
                 }
             }

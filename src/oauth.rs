@@ -467,7 +467,7 @@ impl LoginAdapter for CodexLoginAdapter {
                     base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
                 let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
                 let exp = v.get("exp")?.as_i64()?;
-                Some(exp * 1000)
+                Some(exp.saturating_mul(1000))
             })
             .unwrap_or(0);
         Ok(FreshTokens {

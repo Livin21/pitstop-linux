@@ -5,7 +5,6 @@ mod codex_store;
 mod credentials;
 mod format;
 mod gemini;
-#[allow(dead_code)] // keyring-backed store consumed by the tray/switch flow in Tasks 6-8
 mod gemini_store;
 mod icon;
 mod model;

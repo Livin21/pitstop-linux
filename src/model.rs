@@ -1,7 +1,7 @@
 //! Menu/account model + the user-facing setting enums. Ported from the small
 //! enums in `AppDelegate.swift` and `Settings.swift`. Claude Desktop's `.desktop`
 //! and `.both` sources are dropped (no Claude Desktop on Linux), so every
-//! account is either switchable Claude Code or switchable Codex.
+//! account is switchable Claude Code, Codex, or Gemini (Antigravity).
 
 use crate::usage_api::UsageReport;
 
@@ -37,8 +37,6 @@ impl Provider {
 pub enum Source {
     Code,
     Codex,
-    // Scaffolded for Plan 4 Gemini integration; wired up in later tasks.
-    #[allow(dead_code)]
     Gemini,
 }
 
@@ -57,8 +55,6 @@ impl MenuAccount {
     pub fn is_codex(&self) -> bool {
         self.source == Source::Codex
     }
-    // Scaffolded for Plan 4 Gemini integration; called in later tasks.
-    #[allow(dead_code)]
     pub fn is_gemini(&self) -> bool {
         self.source == Source::Gemini
     }

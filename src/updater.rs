@@ -15,7 +15,6 @@ const CHECK_INTERVAL_SECS: u64 = 86_400; // 24 hours
 /// Information about an available update. Present only when the remote version
 /// is strictly newer than the running build.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct UpdateInfo {
     /// New version, leading "v" stripped (e.g. "0.4.0").
     pub version: String,

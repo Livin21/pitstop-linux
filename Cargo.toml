@@ -2,7 +2,7 @@
 name = "pitstop"
 version = "0.3.1"
 edition = "2021"
-description = "Linux tray app that tracks AI coding usage limits (Claude Code, OpenAI Codex) and switches accounts"
+description = "Linux tray app that tracks AI coding usage limits (Claude Code, OpenAI Codex, Google Gemini) and switches accounts"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
