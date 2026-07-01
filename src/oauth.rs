@@ -2,6 +2,7 @@
 //! inactive Claude Code & Codex rows. Writes fresh tokens ONLY into the
 //! saved-profile snapshot — never the live store.
 
+use anyhow::Result;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use rand::RngCore;
@@ -34,9 +35,64 @@ impl Pkce {
     }
 }
 
+/// Fresh tokens from an authorization_code exchange, provider-neutral.
+/// NOTE: secret-bearing — must NOT derive Debug.
+#[allow(dead_code)]
+pub struct FreshTokens {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub id_token: Option<String>,
+    pub expires_at_ms: i64,
+}
+
+/// The authenticated identity, for matching against the target row.
+#[allow(dead_code)]
+pub struct LoginIdentity {
+    pub email: String,
+    pub account_id: Option<String>,
+}
+
+/// The provider-varying surface of the OAuth login flow.
+#[async_trait::async_trait]
+#[allow(dead_code)]
+pub trait LoginAdapter: Send + Sync {
+    fn authorize_url(&self, pkce: &Pkce, redirect_uri: &str, paste_mode: bool) -> String;
+    /// Codex `Some(1455)` (falls back to 1457); Claude `None` (ephemeral).
+    fn fixed_loopback_port(&self) -> Option<u16>;
+    fn redirect_path(&self) -> &'static str;
+    fn supports_paste(&self) -> bool;
+    /// Hosted redirect used in paste mode; default "" when unsupported.
+    fn paste_redirect_uri(&self) -> &'static str {
+        ""
+    }
+    async fn exchange(
+        &self,
+        http: &reqwest::Client,
+        code: &str,
+        pkce: &Pkce,
+        redirect_uri: &str,
+    ) -> Result<FreshTokens>;
+    async fn identity(&self, http: &reqwest::Client, t: &FreshTokens) -> Result<LoginIdentity>;
+    /// Patch the saved profile blob with fresh tokens and write it back to the
+    /// profile slot ONLY. Never touches the live store.
+    async fn persist(&self, email: &str, t: &FreshTokens) -> Result<()>;
+}
+
+/// Identity match against the row's email (case- and whitespace-insensitive).
+/// Email is unique per account, so this alone gates persistence.
+pub fn email_matches(expected: &str, got: &str) -> bool {
+    expected.trim().to_lowercase() == got.trim().to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn email_match_is_case_and_space_insensitive() {
+        assert!(email_matches("  Me@Example.com ", "me@example.com"));
+        assert!(!email_matches("me@example.com", "other@example.com"));
+    }
 
     // RFC 7636 Appendix B test vector.
     #[test]
