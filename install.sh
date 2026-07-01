@@ -18,6 +18,11 @@ BIN="$BIN_DIR/pitstop"
 mkdir -p "$BIN_DIR"
 install -m755 target/release/pitstop "$BIN"
 
+# Record the absolute source checkout path so the updater can rebuild from source.
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pitstop"
+mkdir -p "$CONFIG_DIR"
+printf '%s\n' "$(pwd)" > "$CONFIG_DIR/repo_path"
+
 ICON_DIR="$HOME/.local/share/icons/hicolor/128x128/apps"
 mkdir -p "$ICON_DIR"
 "$BIN" --export-icon "$ICON_DIR/pitstop.png" >/dev/null || true

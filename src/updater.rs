@@ -141,10 +141,31 @@ pub async fn check(http: &reqwest::Client) -> Option<UpdateInfo> {
     parse_release(&root, local)
 }
 
-// stubs — replaced in Tasks 4 and 5
-#[allow(dead_code)]
+// ---------- repo-path resolution ----------
+
+/// Read the source checkout path recorded by install.sh into
+/// ~/.config/pitstop/repo_path.
+fn read_repo_path() -> Option<String> {
+    let path = crate::util::config_dir().join("repo_path");
+    let s = std::fs::read_to_string(&path).ok()?;
+    let trimmed = s.trim().to_string();
+    if trimmed.is_empty() { None } else { Some(trimmed) }
+}
+
+/// Pure validation: returns true when `repo_dir` contains both `.git/` and
+/// `install.sh`. Extracted as a pure function so tests can probe any path
+/// without reading ~/.config/pitstop/repo_path.
+pub fn repo_is_valid(repo_dir: &str) -> bool {
+    let p = std::path::Path::new(repo_dir);
+    p.join(".git").exists() && p.join("install.sh").exists()
+}
+
+/// True when the path recorded by install.sh exists and is a usable checkout.
 pub fn source_repo_valid() -> bool {
-    false
+    read_repo_path()
+        .as_deref()
+        .map(repo_is_valid)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -253,5 +274,31 @@ mod tests {
             can_rebuild: false,
         };
         let _copy = info.clone();
+    }
+
+    // --- Task 4 ---
+
+    #[test]
+    fn missing_path_not_valid() {
+        // pure function: a nonexistent path must return false
+        assert!(!repo_is_valid("/nonexistent/pitstop_test_repo_abc123"));
+    }
+
+    #[test]
+    fn valid_checkout_structure() {
+        let dir = std::env::temp_dir().join("pitstop_test_valid_repo");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("install.sh"), b"#!/bin/bash\n").unwrap();
+        assert!(repo_is_valid(dir.to_str().unwrap()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_install_sh_not_valid() {
+        let dir = std::env::temp_dir().join("pitstop_test_no_install_sh");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        // no install.sh → not valid
+        assert!(!repo_is_valid(dir.to_str().unwrap()));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
