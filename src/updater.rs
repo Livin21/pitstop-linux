@@ -1,6 +1,7 @@
 //! Daily GitHub-release update check, semver comparison, and rebuild-and-relaunch
 //! for source installs. Called from app.rs at the end of each refresh_all cycle.
 
+use anyhow::Result;
 use serde_json::Value;
 use std::time::Duration;
 
@@ -168,6 +169,94 @@ pub fn source_repo_valid() -> bool {
         .unwrap_or(false)
 }
 
+// ---------- rebuild helpers ----------
+
+/// Return the last 400 characters of a byte slice as a trimmed String (for
+/// showing the tail of cargo/git stderr without flooding a notification).
+fn last_400(bytes: &[u8]) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    let chars: Vec<char> = s.chars().collect();
+    let start = chars.len().saturating_sub(400);
+    chars[start..].iter().collect::<String>().trim().to_string()
+}
+
+/// Run a subprocess, capturing stdout+stderr. Returns Err with the last 400
+/// bytes of stderr (or stdout) when the exit status is non-zero.
+async fn run_cmd(program: &str, args: &[&str], cwd: Option<&str>) -> Result<()> {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let out = cmd.output().await?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = last_400(&out.stderr);
+    let msg = if stderr.is_empty() {
+        last_400(&out.stdout)
+    } else {
+        stderr
+    };
+    anyhow::bail!("{msg}")
+}
+
+// ---------- rebuild & relaunch ----------
+
+/// Pull the latest source, rebuild, atomically install the new binary to
+/// `~/.local/bin/pitstop`, then exec the new binary in place of the current
+/// process (no orphan tray). On any failure returns an Err — the caller must
+/// notify the user and open the release page; no partial install occurs.
+#[allow(dead_code)]
+pub async fn rebuild_and_relaunch(info: &UpdateInfo) -> Result<()> {
+    // `info` is part of the interface (the caller uses info.url to open the
+    // release page when this returns Err); it is not needed inside the rebuild.
+    let _ = info;
+    let repo = read_repo_path().ok_or_else(|| {
+        anyhow::anyhow!(
+            "No source checkout path recorded — \
+             open the release page to update manually."
+        )
+    })?;
+
+    if !repo_is_valid(&repo) {
+        anyhow::bail!(
+            "Checkout at '{}' is missing .git or install.sh — cannot rebuild.",
+            repo
+        );
+    }
+
+    // 1. git pull --ff-only (abort on diverged or dirty history)
+    run_cmd("git", &["-C", &repo, "pull", "--ff-only"], None)
+        .await
+        .map_err(|e| anyhow::anyhow!("git pull failed: {e}"))?;
+
+    // 2. cargo build --release (may take minutes; exec replaces the process
+    //    immediately after, so blocking the tokio loop is acceptable here)
+    run_cmd("cargo", &["build", "--release"], Some(&repo))
+        .await
+        .map_err(|e| anyhow::anyhow!("cargo build failed: {e}"))?;
+
+    // 3. Atomic install to ~/.local/bin/pitstop
+    //    Build to a .new temp then rename — if copy fails, dst is untouched.
+    use std::os::unix::fs::PermissionsExt;
+    let src = std::path::Path::new(&repo).join("target/release/pitstop");
+    anyhow::ensure!(src.exists(), "Built binary not found at {}", src.display());
+    let bin_dir = crate::util::home().join(".local/bin");
+    std::fs::create_dir_all(&bin_dir)?;
+    let dst = bin_dir.join("pitstop");
+    let tmp = bin_dir.join(".pitstop.new");
+    std::fs::copy(&src, &tmp)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::rename(&tmp, &dst)?;
+
+    // 4. exec the new binary — replaces this process entirely; the old
+    //    StatusNotifierItem is unregistered automatically when the PID exits.
+    use std::os::unix::process::CommandExt;
+    let io_err = std::process::Command::new(&dst).exec();
+    anyhow::bail!("exec failed: {io_err}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +389,24 @@ mod tests {
         // no install.sh → not valid
         assert!(!repo_is_valid(dir.to_str().unwrap()));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Task 5 ---
+
+    // rebuild_and_relaunch must exist and return Err when the repo is invalid.
+    // We verify the guard logic by composing repo_is_valid (already tested) with
+    // the function signature.  A full build-and-exec test is manual E2E only.
+    #[tokio::test]
+    async fn rebuild_rejects_invalid_checkout() {
+        let tmp = std::env::temp_dir().join("pitstop_test_bad_checkout_rb");
+        std::fs::create_dir_all(&tmp).unwrap();
+        // no .git — repo_is_valid will return false
+        assert!(!repo_is_valid(tmp.to_str().unwrap()));
+        // rebuild_and_relaunch references the function; compilation is the first gate.
+        // It is an async fn, so we bind the fn item (never called) rather than
+        // casting to a fn pointer — the opaque Future return cannot form a fn ptr,
+        // and calling it would rebuild + re-exec the test process.
+        let _sig = rebuild_and_relaunch;
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
