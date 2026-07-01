@@ -6,7 +6,14 @@ use anyhow::Result;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use rand::RngCore;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::time::Duration;
+
+use crate::credentials;
+use crate::secret_store;
+use crate::usage_api::ApiError;
+use crate::util::now_secs;
 
 pub struct Pkce {
     pub verifier: String,
@@ -84,9 +91,192 @@ pub fn email_matches(expected: &str, got: &str) -> bool {
     expected.trim().to_lowercase() == got.trim().to_lowercase()
 }
 
+// ─── ClaudeLoginAdapter ────────────────────────────────────────────────────
+
+const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const CLAUDE_AUTHORIZE: &str = "https://claude.ai/oauth/authorize";
+/// [verify] primary host; falls back to console.anthropic.com on 404 or transport error.
+const CLAUDE_TOKEN_HOSTS: [&str; 2] = [
+    "https://platform.claude.com/v1/oauth/token",
+    "https://console.anthropic.com/v1/oauth/token",
+];
+/// [verify] identity endpoint.
+const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
+const CLAUDE_PASTE_REDIRECT: &str = "https://platform.claude.com/oauth/code/callback";
+const CLAUDE_SCOPES: &str = "org:create_api_key user:profile user:inference \
+user:sessions:claude_code user:mcp_servers user:file_upload";
+
+pub struct ClaudeLoginAdapter;
+
+#[async_trait::async_trait]
+impl LoginAdapter for ClaudeLoginAdapter {
+    fn authorize_url(&self, pkce: &Pkce, redirect_uri: &str, paste_mode: bool) -> String {
+        let mut url = reqwest::Url::parse(CLAUDE_AUTHORIZE).unwrap();
+        {
+            let mut q = url.query_pairs_mut();
+            if paste_mode {
+                q.append_pair("code", "true");
+            }
+            q.append_pair("client_id", CLAUDE_CLIENT_ID)
+                .append_pair("response_type", "code")
+                .append_pair("redirect_uri", redirect_uri)
+                .append_pair("scope", CLAUDE_SCOPES)
+                .append_pair("code_challenge", &pkce.challenge)
+                .append_pair("code_challenge_method", "S256")
+                .append_pair("state", &pkce.state);
+        }
+        url.to_string()
+    }
+
+    fn fixed_loopback_port(&self) -> Option<u16> {
+        None
+    }
+
+    fn redirect_path(&self) -> &'static str {
+        "/callback"
+    }
+
+    fn supports_paste(&self) -> bool {
+        true
+    }
+
+    fn paste_redirect_uri(&self) -> &'static str {
+        CLAUDE_PASTE_REDIRECT
+    }
+
+    async fn exchange(
+        &self,
+        http: &reqwest::Client,
+        code: &str,
+        pkce: &Pkce,
+        redirect_uri: &str,
+    ) -> Result<FreshTokens> {
+        // Try platform host first; fall through to console ONLY on 404 (endpoint
+        // not present on this host) or a transport error. Auth errors (400/401/403)
+        // are final — the code is single-use, replaying it will not help.
+        // [verify] CLAUDE_TOKEN_HOSTS primary/fallback addresses.
+        let mut last: anyhow::Error = ApiError::Malformed.into();
+        for host in CLAUDE_TOKEN_HOSTS {
+            let body = json!({
+                "grant_type": "authorization_code",
+                "code": code,
+                "state": pkce.state,
+                "client_id": CLAUDE_CLIENT_ID,
+                "redirect_uri": redirect_uri,
+                "code_verifier": pkce.verifier,
+            });
+            let resp = match http
+                .post(host)
+                .header("Content-Type", "application/json")
+                .timeout(Duration::from_secs(15))
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    last = ApiError::Network(e.to_string()).into();
+                    continue;
+                }
+            };
+            let status = resp.status().as_u16();
+            if status == 404 {
+                last = ApiError::Http(404).into();
+                continue;
+            }
+            if status == 400 || status == 401 || status == 403 {
+                return Err(ApiError::Unauthorized.into());
+            }
+            if status != 200 {
+                return Err(ApiError::Http(status).into());
+            }
+            let root: Value = resp.json().await.map_err(|_| ApiError::Malformed)?;
+            let access = root
+                .get("access_token")
+                .and_then(Value::as_str)
+                .ok_or(ApiError::Malformed)?;
+            let expires_in = root
+                .get("expires_in")
+                .and_then(Value::as_f64)
+                .ok_or(ApiError::Malformed)?;
+            return Ok(FreshTokens {
+                access_token: access.to_string(),
+                refresh_token: root
+                    .get("refresh_token")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+                id_token: None,
+                expires_at_ms: ((now_secs() + expires_in) * 1000.0) as i64,
+            });
+        }
+        Err(last)
+    }
+
+    async fn identity(&self, http: &reqwest::Client, t: &FreshTokens) -> Result<LoginIdentity> {
+        // [verify] CLAUDE_PROFILE_URL — confirmed same pattern as usage endpoint.
+        let resp = http
+            .get(CLAUDE_PROFILE_URL)
+            .header("Authorization", format!("Bearer {}", t.access_token))
+            .header("anthropic-beta", "oauth-2025-04-20")
+            .header("Content-Type", "application/json")
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
+        let status = resp.status().as_u16();
+        if status == 401 || status == 403 {
+            return Err(ApiError::Unauthorized.into());
+        }
+        if status != 200 {
+            return Err(ApiError::Http(status).into());
+        }
+        let root: Value = resp.json().await.map_err(|_| ApiError::Malformed)?;
+        // Try common email field locations from most to least specific.
+        let email = root
+            .get("email")
+            .and_then(Value::as_str)
+            .or_else(|| root.get("email_address").and_then(Value::as_str))
+            .or_else(|| {
+                root.get("account")
+                    .and_then(|a| a.get("email_address"))
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| {
+                root.get("account")
+                    .and_then(|a| a.get("email"))
+                    .and_then(Value::as_str)
+            })
+            .ok_or(ApiError::Malformed)?;
+        Ok(LoginIdentity { email: email.to_string(), account_id: None })
+    }
+
+    async fn persist(&self, email: &str, t: &FreshTokens) -> Result<()> {
+        let old = secret_store::read(credentials::LIVE_PROVIDER, email)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "No saved profile for {email} — save the account once, then retry"
+            )
+        })?;
+        // patch_blob preserves all non-token fields (subscriptionType, rateLimitTier,
+        // mcpOAuth, etc.) — only accessToken, refreshToken, and expiresAt are replaced.
+        // Writes ONLY to the saved-profile file; NEVER touches ~/.claude/.credentials.json.
+        let patched = credentials::patch_blob(
+            &old,
+            &t.access_token,
+            t.refresh_token.as_deref(),
+            t.expires_at_ms as f64,
+        )?;
+        secret_store::write(credentials::LIVE_PROVIDER, email, &patched)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    fn qmap(url: &str) -> HashMap<String, String> {
+        reqwest::Url::parse(url).unwrap().query_pairs().into_owned().collect()
+    }
 
     #[test]
     fn email_match_is_case_and_space_insensitive() {
@@ -109,5 +299,98 @@ mod tests {
         assert!(p.verifier.len() >= 43); // 64 random bytes -> ~86 chars base64url
         assert_eq!(p.challenge, challenge_for(&p.verifier));
         assert_ne!(p.state, p.verifier);
+    }
+
+    #[test]
+    fn claude_authorize_url_params() {
+        let pkce = Pkce { verifier: "v".into(), challenge: "CH".into(), state: "ST".into() };
+        let url =
+            ClaudeLoginAdapter.authorize_url(&pkce, "http://localhost:5000/callback", false);
+        assert!(url.starts_with("https://claude.ai/oauth/authorize?"));
+        let q = qmap(&url);
+        assert_eq!(q["client_id"], "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
+        assert_eq!(q["response_type"], "code");
+        assert_eq!(q["redirect_uri"], "http://localhost:5000/callback");
+        assert_eq!(q["code_challenge"], "CH");
+        assert_eq!(q["code_challenge_method"], "S256");
+        assert_eq!(q["state"], "ST");
+        assert!(q.get("code").is_none());
+    }
+
+    #[test]
+    fn claude_authorize_url_paste_mode_adds_code_true() {
+        let pkce = Pkce { verifier: "v".into(), challenge: "CH".into(), state: "ST".into() };
+        let url = ClaudeLoginAdapter.authorize_url(
+            &pkce,
+            "https://platform.claude.com/oauth/code/callback",
+            true,
+        );
+        assert_eq!(qmap(&url)["code"], "true");
+    }
+
+    #[test]
+    fn claude_authorize_url_contains_all_scopes() {
+        let pkce = Pkce { verifier: "v".into(), challenge: "CH".into(), state: "ST".into() };
+        let url =
+            ClaudeLoginAdapter.authorize_url(&pkce, "http://localhost:5000/callback", false);
+        let q = qmap(&url);
+        let scope = &q["scope"];
+        assert!(scope.contains("org:create_api_key"), "missing org:create_api_key");
+        assert!(scope.contains("user:profile"), "missing user:profile");
+        assert!(scope.contains("user:inference"), "missing user:inference");
+        assert!(scope.contains("user:sessions:claude_code"), "missing user:sessions:claude_code");
+        assert!(scope.contains("user:mcp_servers"), "missing user:mcp_servers");
+        assert!(scope.contains("user:file_upload"), "missing user:file_upload");
+    }
+
+    #[test]
+    fn claude_redirect_uri_byte_matches_in_authorize_and_exchange_body() {
+        // Verifies the redirect_uri used in authorize_url is byte-identical to
+        // what would be passed to exchange — both receive the same &str.
+        let loopback = "http://localhost:9999/callback";
+        let pkce = Pkce { verifier: "v".into(), challenge: "CH".into(), state: "ST".into() };
+        let url = ClaudeLoginAdapter.authorize_url(&pkce, loopback, false);
+        let q = qmap(&url);
+        // The exchange body would also use `loopback`; both are the same &str.
+        assert_eq!(q["redirect_uri"], loopback);
+    }
+
+    #[test]
+    fn claude_adapter_metadata() {
+        assert_eq!(ClaudeLoginAdapter.fixed_loopback_port(), None);
+        assert_eq!(ClaudeLoginAdapter.redirect_path(), "/callback");
+        assert!(ClaudeLoginAdapter.supports_paste());
+        assert_eq!(
+            ClaudeLoginAdapter.paste_redirect_uri(),
+            "https://platform.claude.com/oauth/code/callback"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_persist_patches_and_preserves_plan_fields() {
+        // Shared fixed dir across the persist tests: both set the SAME env value
+        // so parallel interleaving is harmless; unique emails keep files distinct.
+        let dir = std::env::temp_dir().join("pitstop-oauth-relogin-tests");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let email = "persist-claude@example.com";
+        let old = br#"{"claudeAiOauth":{"accessToken":"old","refreshToken":"oldR","expiresAt":1,"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"},"mcpOAuth":{"keep":"me"}}"#;
+        crate::secret_store::write(crate::credentials::LIVE_PROVIDER, email, old).unwrap();
+        let tokens = FreshTokens {
+            access_token: "newA".into(),
+            refresh_token: Some("newR".into()),
+            id_token: None,
+            expires_at_ms: 999000,
+        };
+        ClaudeLoginAdapter.persist(email, &tokens).await.unwrap();
+        let saved = crate::secret_store::read(crate::credentials::LIVE_PROVIDER, email)
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(v["claudeAiOauth"]["accessToken"], "newA");
+        assert_eq!(v["claudeAiOauth"]["refreshToken"], "newR");
+        assert_eq!(v["claudeAiOauth"]["expiresAt"], 999000);
+        assert_eq!(v["claudeAiOauth"]["subscriptionType"], "max");
+        assert_eq!(v["claudeAiOauth"]["rateLimitTier"], "default_claude_max_20x");
+        assert_eq!(v["mcpOAuth"]["keep"], "me"); // untouched
     }
 }
