@@ -19,6 +19,7 @@ use crate::notify;
 use crate::oauth::{self, LoginAdapter};
 use crate::settings::{self, Settings};
 use crate::tray::{GroupView, PitStopTray, RowView, TrayView};
+use crate::updater::{self, UpdateInfo};
 use crate::usage_api::{self, ApiError, UsageReport};
 use chrono::{DateTime, Local};
 use ksni::Handle;
@@ -39,6 +40,8 @@ pub enum Action {
     SetSetting(SettingChange),
     Login { key: String },
     LoginFinished { key: String, result: Result<(), String> },
+    #[allow(dead_code)] // constructed by Task 7 (tray menu render)
+    UpdateAndRelaunch,
     Quit,
 }
 
@@ -88,6 +91,7 @@ pub struct Engine {
     last_refresh: Option<DateTime<Local>>,
     last_top_level_error: Option<String>,
     next_periodic: Instant,
+    update_info: Option<UpdateInfo>,
 
     action_tx: UnboundedSender<Action>,
     login_in_flight: bool,
@@ -120,6 +124,7 @@ impl Engine {
             last_refresh: None,
             last_top_level_error: None,
             next_periodic: Instant::now() + REFRESH_INTERVAL,
+            update_info: None,
             action_tx,
             login_in_flight: false,
         }
@@ -248,6 +253,20 @@ impl Engine {
                     }
                 }
             }
+            Action::UpdateAndRelaunch => {
+                if let Some(ref info) = self.update_info.clone() {
+                    match updater::rebuild_and_relaunch(info).await {
+                        Ok(()) => {} // unreachable: exec replaced this process
+                        Err(e) => {
+                            notify::post(
+                                "Update failed — opening release page",
+                                &e.to_string(),
+                            );
+                            open_url(&info.url);
+                        }
+                    }
+                }
+            }
             Action::Quit => std::process::exit(0),
         }
     }
@@ -280,6 +299,10 @@ impl Engine {
             self.record_usage_samples();
         }
         self.next_periodic = Instant::now() + REFRESH_INTERVAL;
+        // Silent daily check for a new GitHub release (best-effort; never blocks refresh).
+        if let Some(result) = updater::check_if_due(&self.client).await {
+            self.update_info = result;
+        }
     }
 
     async fn fetch_pass(&mut self) {
@@ -969,6 +992,7 @@ impl Engine {
             error_line: self.last_top_level_error.clone(),
             settings: self.settings.clone(),
             launch_at_login: settings::launch_at_login_enabled(),
+            update_info: self.update_info.clone(),
         }
     }
 
@@ -1918,6 +1942,15 @@ mod tests {
             ("also_hot@x".to_string(), Some(88.0)),
         ];
         assert!(pick_auto_switch(Some("live@x"), 75.0, None, &utils).is_none());
+    }
+
+    // ── Action::UpdateAndRelaunch (Task 6) ────────────────────────────────
+
+    #[test]
+    fn update_and_relaunch_action_is_clone() {
+        // Verifies that Action::UpdateAndRelaunch variant exists and is Clone.
+        let a = Action::UpdateAndRelaunch;
+        let _b = a.clone();
     }
 
     #[test]

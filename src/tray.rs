@@ -14,6 +14,7 @@ use crate::model::{IndicatorMetric, IndicatorStyle, MenuBarSource};
 use crate::settings::Settings;
 use ksni::menu::{CheckmarkItem, StandardItem, SubMenu};
 use ksni::{Category, Icon, MenuItem, ToolTip, Tray};
+use crate::updater::UpdateInfo;
 use tokio::sync::mpsc::UnboundedSender;
 
 pub struct GroupView {
@@ -42,6 +43,8 @@ pub struct TrayView {
     pub error_line: Option<String>,
     pub settings: Settings,
     pub launch_at_login: bool,
+    #[allow(dead_code)] // read by Task 7 (tray menu render)
+    pub update_info: Option<UpdateInfo>,
 }
 
 impl TrayView {
@@ -56,6 +59,7 @@ impl TrayView {
             error_line: None,
             settings: Settings::default(),
             launch_at_login: false,
+            update_info: None,
         }
     }
 }
