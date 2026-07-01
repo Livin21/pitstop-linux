@@ -170,8 +170,27 @@ pub fn short_model_name(model_id: &str) -> String {
     s.strip_suffix("-preview").unwrap_or(s).to_string()
 }
 
+/// Collapse windows that share the same (shortened) label, keeping the one with
+/// the highest `used_percent`. Antigravity can report two quota buckets whose
+/// model ids shorten to the same label (spike finding — e.g. both
+/// `gemini-3.1-flash-lite-preview` and `gemini-3.1-flash-lite` → `3.1-flash-lite`);
+/// rendering both yields a duplicate label in the tray/menu-bar. Order is
+/// preserved by first appearance of each label. Pure so it is unit-testable.
+fn dedupe_windows(windows: Vec<UsageWindow>) -> Vec<UsageWindow> {
+    let mut out: Vec<UsageWindow> = Vec::new();
+    for w in windows {
+        match out.iter_mut().find(|e| e.label == w.label) {
+            Some(existing) if w.used_percent > existing.used_percent => *existing = w,
+            Some(_) => {} // keep the already-recorded higher-usage window
+            None => out.push(w),
+        }
+    }
+    out
+}
+
 /// Parse a retrieveUserQuota response into per-model windows. Buckets missing
-/// `remainingFraction` are skipped.
+/// `remainingFraction` are skipped; windows colliding on the shortened label
+/// are deduped (highest usage wins) so the UI never shows a duplicate label.
 pub fn parse_quota(data: &[u8]) -> Usage {
     let root: Value = serde_json::from_slice(data).unwrap_or(Value::Null);
     let mut windows = Vec::new();
@@ -196,7 +215,7 @@ pub fn parse_quota(data: &[u8]) -> Usage {
         }
     }
     Usage {
-        windows,
+        windows: dedupe_windows(windows),
         fetched_at: Local::now(),
     }
 }
@@ -482,6 +501,26 @@ mod tests {
         assert!((u.windows[0].used_percent - 22.0).abs() < 0.01);
         assert!(u.windows[0].resets_at.is_some());
         assert!((u.max_utilization() - 22.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_quota_dedupes_colliding_short_labels() {
+        // Spike finding: two quota buckets whose model ids both shorten to
+        // "3.1-flash-lite" must collapse to a single window (highest usage wins),
+        // otherwise the tray shows "3.1-flash-lite 0% · 3.1-flash-lite 0%".
+        let data = br#"{"buckets":[
+            {"modelId":"gemini-3.1-flash-lite-preview","remainingFraction":0.90,"resetTime":"2026-07-01T20:00:00Z"},
+            {"modelId":"gemini-3.1-flash-lite","remainingFraction":0.50}
+        ]}"#;
+        let u = parse_quota(data);
+        assert_eq!(u.windows.len(), 1, "colliding labels must collapse to one window");
+        assert_eq!(u.windows[0].label, "3.1-flash-lite");
+        // 1 - 0.50 = 50% (higher) beats 1 - 0.90 = 10%.
+        assert!(
+            (u.windows[0].used_percent - 50.0).abs() < 0.01,
+            "deduped window must keep the higher usage, got {}",
+            u.windows[0].used_percent
+        );
     }
 
     #[test]

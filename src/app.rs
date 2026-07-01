@@ -8,6 +8,8 @@ use crate::claude_store::ProfileStore;
 use crate::codex;
 use crate::codex_store::CodexStore;
 use crate::credentials::{self, OAuthCredentials};
+use crate::gemini;
+use crate::gemini_store::GeminiStore;
 use crate::format;
 use crate::icon;
 use crate::model::{
@@ -63,13 +65,18 @@ pub struct Engine {
     handle: Handle<PitStopTray>,
     store: ProfileStore,
     codex_store: CodexStore,
+    gemini_store: GeminiStore,
     settings: Settings,
 
     active_email: Option<String>,
     codex_live_email: Option<String>,
+    gemini_live_email: Option<String>,
 
     usage: HashMap<String, UsageReport>, // key: email (Claude)
     codex_usage: HashMap<String, codex::Usage>, // key: "codex:<email>"
+    gemini_usage: HashMap<String, gemini::Usage>, // key: "gemini:<email>"
+    gemini_plan: HashMap<String, String>,        // key: email -> plan chip
+    gemini_email_cache: HashMap<String, String>, // access_token -> email
     fetch_error: HashMap<String, String>,
     needs_action: HashSet<String>,
     next_fetch_allowed: HashMap<String, Instant>,
@@ -93,11 +100,16 @@ impl Engine {
             handle,
             store: ProfileStore::new(),
             codex_store: CodexStore::new(),
+            gemini_store: GeminiStore::new(),
             settings: Settings::load(),
             active_email: None,
             codex_live_email: None,
+            gemini_live_email: None,
             usage: HashMap::new(),
             codex_usage: HashMap::new(),
+            gemini_usage: HashMap::new(),
+            gemini_plan: HashMap::new(),
+            gemini_email_cache: HashMap::new(),
             fetch_error: HashMap::new(),
             needs_action: HashSet::new(),
             next_fetch_allowed: HashMap::new(),
@@ -292,6 +304,7 @@ impl Engine {
         }
 
         self.refresh_codex().await;
+        self.refresh_gemini().await;
         self.last_refresh = Some(Local::now());
     }
 
@@ -431,6 +444,126 @@ impl Engine {
         }
     }
 
+    async fn refresh_gemini(&mut self) {
+        // Resolve + snapshot the live Antigravity account (keyring).
+        let live_blob = match GeminiStore::live_blob().await {
+            Ok(b) => b,
+            Err(e) => {
+                self.last_top_level_error = Some(e.to_string());
+                None
+            }
+        };
+        self.gemini_live_email = None;
+        if let Some(blob) = &live_blob {
+            if let Some(creds) = gemini::antigravity_creds(blob) {
+                if let Ok(email) = self.gemini_email(&creds).await {
+                    self.gemini_live_email = Some(email.clone());
+                    let plan = self.gemini_plan.get(&email).cloned().unwrap_or_default();
+                    if let Err(e) = self.gemini_store.snapshot(&email, blob, &plan) {
+                        self.last_top_level_error = Some(e.to_string());
+                    }
+                }
+            }
+        }
+        self.gemini_store.load();
+
+        let emails: Vec<String> = self
+            .gemini_store
+            .profiles
+            .iter()
+            .map(|p| p.email.clone())
+            .collect();
+        for email in emails {
+            let key = format!("gemini:{email}");
+            if !self.passed_backoff_gate(&key) {
+                continue;
+            }
+            let is_live = Some(&email) == self.gemini_live_email.as_ref();
+            match self.fetch_gemini_usage(&email, is_live).await {
+                Ok((usage, plan)) => {
+                    self.gemini_usage.insert(key.clone(), usage);
+                    if !plan.is_empty() {
+                        self.gemini_plan.insert(email.clone(), plan);
+                    }
+                    self.clear_fetch_error(&key);
+                }
+                Err(e) => self.record_fetch_error(e, &key),
+            }
+        }
+    }
+
+    /// Resolve the email for a credential blob, caching by access token. Refreshes
+    /// in memory first if the token has aged out (never persists the live token).
+    async fn gemini_email(&mut self, creds: &gemini::Creds) -> Result<String, ApiError> {
+        if let Some(e) = self.gemini_email_cache.get(&creds.access_token) {
+            return Ok(e.clone());
+        }
+        let token = if creds.is_expired() {
+            match &creds.refresh_token {
+                Some(rt) => gemini::refresh(&self.client, rt).await?.access_token,
+                None => creds.access_token.clone(),
+            }
+        } else {
+            creds.access_token.clone()
+        };
+        let email = gemini::fetch_email(&self.client, &token).await?;
+        self.gemini_email_cache
+            .insert(creds.access_token.clone(), email.clone());
+        Ok(email)
+    }
+
+    /// Usage + plan chip for one account. Refreshes an expired token in memory;
+    /// persists the rotated token to the snapshot ONLY for inactive accounts.
+    async fn fetch_gemini_usage(
+        &self,
+        email: &str,
+        is_live: bool,
+    ) -> Result<(gemini::Usage, String), ApiError> {
+        let blob = if is_live {
+            GeminiStore::live_blob()
+                .await
+                .map_err(|e| ApiError::Network(e.to_string()))?
+        } else {
+            self.gemini_store
+                .saved_blob(email)
+                .map_err(|e| ApiError::Network(e.to_string()))?
+        }
+        .ok_or(ApiError::Unauthorized)?;
+        let creds = gemini::antigravity_creds(&blob).ok_or(ApiError::Unauthorized)?;
+        let access = if creds.is_expired() {
+            let rt = creds.refresh_token.clone().ok_or(ApiError::Unauthorized)?;
+            let refreshed = gemini::refresh(&self.client, &rt).await?;
+            if !is_live {
+                if let Some(patched) = gemini::patch_antigravity_blob(
+                    &blob,
+                    &refreshed.access_token,
+                    refreshed.id_token.as_deref(),
+                    &gemini::expiry_iso(refreshed.expires_at_ms),
+                ) {
+                    self.gemini_store
+                        .store_refreshed_blob(&patched, email)
+                        .map_err(|e| ApiError::Network(e.to_string()))?;
+                }
+            }
+            refreshed.access_token
+        } else {
+            creds.access_token.clone()
+        };
+        let (project, plan) = gemini::load_project(&self.client, &access).await?;
+        let Some(project) = project else {
+            // Signed in, no Code Assist project → presence-only row (no bar).
+            return Ok((
+                gemini::Usage {
+                    windows: vec![],
+                    fetched_at: chrono::Local::now(),
+                },
+                plan,
+            ));
+        };
+        let usage = gemini::fetch_usage(&self.client, &access, &project).await?;
+        Ok((usage, plan))
+    }
+
     // MARK: - Projection / thresholds / auto-switch
 
     fn record_usage_samples(&mut self) {
@@ -454,6 +587,14 @@ impl Engine {
                 continue;
             }
             for w in &cu.windows {
+                windows.push((key.clone(), w.label.clone(), w.used_percent));
+            }
+        }
+        for (key, gu) in &self.gemini_usage {
+            if self.fetch_error.contains_key(key) {
+                continue;
+            }
+            for w in &gu.windows {
                 windows.push((key.clone(), w.label.clone(), w.used_percent));
             }
         }
@@ -950,11 +1091,13 @@ impl Engine {
                     }
                 };
                 for (key, report) in &self.usage {
-                    consider(key.clone(), report.max_utilization(), self.fetch_error.contains_key(key));
+                    consider(menu_label(key), report.max_utilization(), self.fetch_error.contains_key(key));
                 }
                 for (key, cu) in &self.codex_usage {
-                    let email = key.strip_prefix("codex:").unwrap_or(key);
-                    consider(format!("{email} (Codex)"), cu.max_utilization(), self.fetch_error.contains_key(key));
+                    consider(menu_label(key), cu.max_utilization(), self.fetch_error.contains_key(key));
+                }
+                for (key, gu) in &self.gemini_usage {
+                    consider(menu_label(key), gu.max_utilization(), self.fetch_error.contains_key(key));
                 }
                 match best {
                     Some((name, util, stale)) => {
@@ -1132,6 +1275,19 @@ fn window_name(label: &str) -> String {
         "7d"  => "weekly".into(),
         "30d" => "monthly".into(),
         other => other.to_string(),
+    }
+}
+
+/// Menu-bar label for an account key, namespacing non-Claude providers. A
+/// `"codex:<email>"` key renders as `"<email> (Codex)"`, `"gemini:<email>"` as
+/// `"<email> (Gemini)"`, and a bare Claude email is used verbatim.
+fn menu_label(key: &str) -> String {
+    if let Some(e) = key.strip_prefix("codex:") {
+        format!("{e} (Codex)")
+    } else if let Some(e) = key.strip_prefix("gemini:") {
+        format!("{e} (Gemini)")
+    } else {
+        key.to_string()
     }
 }
 
@@ -1519,6 +1675,13 @@ mod tests {
         let (email, provider) = login_key_provider("codex:");
         assert!(email.is_empty());
         assert!(provider == Provider::Codex);
+    }
+
+    #[test]
+    fn menu_label_namespaces_providers() {
+        assert_eq!(menu_label("me@x"), "me@x"); // Claude (bare email)
+        assert_eq!(menu_label("codex:me@x"), "me@x (Codex)");
+        assert_eq!(menu_label("gemini:me@x"), "me@x (Gemini)");
     }
 
     #[test]
