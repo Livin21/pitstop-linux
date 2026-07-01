@@ -32,6 +32,8 @@ pub enum Action {
     Switch { key: String },
     Save,
     Remove { key: String },
+    #[allow(dead_code)] // constructed in Task 3 (menu items)
+    OpenUrl(String),
     SetSetting(SettingChange),
     Quit,
 }
@@ -191,6 +193,9 @@ impl Engine {
                 self.next_fetch_allowed.remove(&key);
                 self.failure_count.remove(&key);
                 self.render().await;
+            }
+            Action::OpenUrl(url) => {
+                open_url(&url);
             }
             Action::SetSetting(change) => {
                 self.apply_setting(change);
@@ -1130,6 +1135,20 @@ fn pick_auto_switch(
     Some((target.0, reason))
 }
 
+/// Shells out to `xdg-open` to open `url` in the default browser.
+/// Fire-and-forget: if `xdg-open` is absent the error goes to stderr only.
+pub(crate) fn open_url(url: &str) {
+    use std::process::{Command, Stdio};
+    let result = Command::new("xdg-open")
+        .arg(url)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if result.is_err() {
+        eprintln!("PitStop: xdg-open unavailable — visit {url}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1363,5 +1382,18 @@ mod tests {
         let resets_later = Some(Utc::now() + chrono::Duration::seconds(3600));
         let result = projected_full_from_samples(&samples, 70.0, resets_later);
         assert!(result.is_some(), "resets after full → should project");
+    }
+
+    // ── Action::OpenUrl ────────────────────────────────────────────────────
+
+    #[test]
+    fn action_open_url_variant_round_trips() {
+        let action = Action::OpenUrl("https://claude.ai/new#settings/usage".to_string());
+        match &action {
+            Action::OpenUrl(url) => {
+                assert_eq!(url, "https://claude.ai/new#settings/usage");
+            }
+            _ => panic!("Expected Action::OpenUrl"),
+        }
     }
 }
