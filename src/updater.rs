@@ -51,11 +51,16 @@ pub fn is_newer(remote: &str, local: &str) -> bool {
 
 // ---------- daily throttle ----------
 
+// Sync std::fs I/O here is intentional — reads a tiny local timestamp file,
+// matching the pattern used by ProfileStore/CodexStore/secret_store throughout
+// the app (small local-file operations, not worth async overhead).
 fn last_check_secs() -> Option<u64> {
     let path = crate::util::config_dir().join("last_update_check");
     std::fs::read_to_string(&path).ok()?.trim().parse().ok()
 }
 
+// Sync write via write_atomic is intentional for the same reason as
+// last_check_secs — tiny local-file I/O consistent with the app's store pattern.
 fn touch_last_check() {
     let path = crate::util::config_dir().join("last_update_check");
     let ts = crate::util::now_secs() as u64;
@@ -82,6 +87,38 @@ pub async fn check_if_due(http: &reqwest::Client) -> Option<Option<UpdateInfo>> 
 
 // ---------- GitHub check ----------
 
+/// Pure parse function: extract an [`UpdateInfo`] from a GitHub release JSON
+/// object, returning `None` when the release should be skipped (prerelease,
+/// draft, not newer than `local`, or missing required fields).
+///
+/// Extracted so tests can exercise the exact production parsing path without
+/// making network calls.
+fn parse_release(root: &Value, local: &str) -> Option<UpdateInfo> {
+    // /releases/latest already skips pre-releases; guard defensively.
+    if root.get("prerelease").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    // Defense-in-depth: exclude draft releases in case the endpoint changes.
+    if root.get("draft").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    let tag = root.get("tag_name").and_then(Value::as_str)?;
+    if !is_newer(tag, local) {
+        return None;
+    }
+    let release_url = root
+        .get("html_url")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("https://github.com/{REPO_SLUG}/releases/latest"));
+    let display = tag.trim_start_matches('v').to_string();
+    Some(UpdateInfo {
+        version: display,
+        url: release_url,
+        can_rebuild: source_repo_valid(),
+    })
+}
+
 /// Fetch the latest non-prerelease GitHub release and compare to the running
 /// build version. Returns None when up to date, on 404 (no releases), or on
 /// any transient network or parse failure (silent, best-effort).
@@ -101,25 +138,7 @@ pub async fn check(http: &reqwest::Client) -> Option<UpdateInfo> {
         return None; // 404 = no releases yet, other = transient error
     }
     let root: Value = resp.json().await.ok()?;
-    // /releases/latest already skips pre-releases; guard defensively.
-    if root.get("prerelease").and_then(Value::as_bool).unwrap_or(false) {
-        return None;
-    }
-    let tag = root.get("tag_name").and_then(Value::as_str)?;
-    if !is_newer(tag, local) {
-        return None;
-    }
-    let release_url = root
-        .get("html_url")
-        .and_then(Value::as_str)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("https://github.com/{REPO_SLUG}/releases/latest"));
-    let display = tag.trim_start_matches('v').to_string();
-    Some(UpdateInfo {
-        version: display,
-        url: release_url,
-        can_rebuild: source_repo_valid(),
-    })
+    parse_release(&root, local)
 }
 
 // stubs — replaced in Tasks 4 and 5
@@ -180,43 +199,49 @@ mod tests {
 
     #[test]
     fn parse_github_release_non_prerelease() {
-        use serde_json::Value;
         let json = r#"{
             "tag_name": "v0.4.0",
             "html_url": "https://github.com/Livin21/pitstop-linux/releases/tag/v0.4.0",
-            "prerelease": false
+            "prerelease": false,
+            "draft": false
         }"#;
-        let root: Value = serde_json::from_str(json).unwrap();
-        let tag = root["tag_name"].as_str().unwrap();
-        let is_pre = root["prerelease"].as_bool().unwrap_or(false);
-        let html = root["html_url"].as_str().unwrap();
-        assert!(!is_pre);
-        assert!(is_newer(tag, "0.3.1"));
+        let root: serde_json::Value = serde_json::from_str(json).unwrap();
+        let info = parse_release(&root, "0.3.1").expect("newer non-prerelease → Some");
+        assert_eq!(info.version, "0.4.0");
         assert_eq!(
-            html,
+            info.url,
             "https://github.com/Livin21/pitstop-linux/releases/tag/v0.4.0"
         );
-        // display form strips the leading "v"
-        assert_eq!(tag.trim_start_matches('v'), "0.4.0");
     }
 
     #[test]
     fn parse_github_release_prerelease_skipped() {
-        use serde_json::Value;
-        let json = r#"{"tag_name":"v0.4.0-alpha","html_url":"https://...","prerelease":true}"#;
-        let root: Value = serde_json::from_str(json).unwrap();
-        // prerelease:true → caller returns None immediately; the field guard is tested here
-        assert!(root["prerelease"].as_bool().unwrap_or(false));
+        let json = r#"{"tag_name":"v0.4.0-alpha","html_url":"https://...","prerelease":true,"draft":false}"#;
+        let root: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert!(
+            parse_release(&root, "0.3.1").is_none(),
+            "prerelease:true → parse_release returns None"
+        );
     }
 
     #[test]
     fn parse_github_release_up_to_date() {
-        use serde_json::Value;
-        let json = r#"{"tag_name":"v0.3.1","html_url":"https://...","prerelease":false}"#;
-        let root: Value = serde_json::from_str(json).unwrap();
-        let tag = root["tag_name"].as_str().unwrap();
-        // same version → is_newer returns false → no update menu item
-        assert!(!is_newer(tag, "0.3.1"), "same version → up to date → no update item");
+        let json = r#"{"tag_name":"v0.3.1","html_url":"https://...","prerelease":false,"draft":false}"#;
+        let root: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert!(
+            parse_release(&root, "0.3.1").is_none(),
+            "same version → up to date → parse_release returns None"
+        );
+    }
+
+    #[test]
+    fn parse_github_release_draft_skipped() {
+        let json = r#"{"tag_name":"v0.4.0","html_url":"https://...","prerelease":false,"draft":true}"#;
+        let root: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert!(
+            parse_release(&root, "0.3.1").is_none(),
+            "draft:true → parse_release returns None"
+        );
     }
 
     #[test]
