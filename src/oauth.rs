@@ -8,10 +8,12 @@ use base64::Engine;
 use rand::RngCore;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::process::Stdio;
 use std::time::Duration;
 
 use crate::codex;
 use crate::credentials;
+use crate::loopback;
 use crate::secret_store;
 use crate::usage_api::ApiError;
 use crate::util::now_secs;
@@ -90,6 +92,144 @@ pub trait LoginAdapter: Send + Sync {
 /// Email is unique per account, so this alone gates persistence.
 pub fn email_matches(expected: &str, got: &str) -> bool {
     expected.trim().to_lowercase() == got.trim().to_lowercase()
+}
+
+const LOOPBACK_TIMEOUT_SECS: u64 = 150;
+
+/// Run one OAuth re-login end to end. Loopback first; Claude falls back to a
+/// zenity paste prompt. Writes only to the profile slot, and only when the
+/// browser identity matches `target_email`.
+///
+/// Designed to run inside a detached `tokio::spawn`: fully async and
+/// cancellable. Dropping the future closes the loopback listener and, because
+/// nothing is written before the identity gate passes, leaves no partial state.
+pub async fn run_login(
+    http: &reqwest::Client,
+    adapter: &dyn LoginAdapter,
+    target_email: &str,
+) -> Result<()> {
+    let pkce = Pkce::generate();
+
+    // --- Attempt A: loopback ---
+    match loopback::Loopback::bind(adapter.fixed_loopback_port()).await {
+        Ok(server) => {
+            let redirect_uri = format!("http://localhost:{}{}", server.port, adapter.redirect_path());
+            let auth_url = adapter.authorize_url(&pkce, &redirect_uri, false);
+            crate::app::open_url(&auth_url);
+            match server.wait(Duration::from_secs(LOOPBACK_TIMEOUT_SECS)).await {
+                Ok(cap) => {
+                    if cap.state != pkce.state {
+                        anyhow::bail!("Sign-in could not be verified (state mismatch)");
+                    }
+                    return finish(http, adapter, target_email, &cap.code, &pkce, &redirect_uri).await;
+                }
+                Err(e) => {
+                    if !adapter.supports_paste() {
+                        return Err(e);
+                    }
+                    // fall through to paste
+                }
+            }
+        }
+        Err(e) => {
+            if !adapter.supports_paste() {
+                return Err(e);
+            }
+        }
+    }
+
+    // --- Attempt B: paste (Claude) ---
+    run_paste(http, adapter, target_email, &pkce).await
+}
+
+async fn run_paste(
+    http: &reqwest::Client,
+    adapter: &dyn LoginAdapter,
+    target_email: &str,
+    pkce: &Pkce,
+) -> Result<()> {
+    let redirect_uri = adapter.paste_redirect_uri().to_string();
+    let auth_url = adapter.authorize_url(pkce, &redirect_uri, true);
+    crate::app::open_url(&auth_url);
+    let pasted = prompt_paste(&auth_url)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Sign-in was cancelled"))?;
+    let cap = loopback::parse_pasted(&pasted)
+        .ok_or_else(|| anyhow::anyhow!("Could not read the pasted code"))?;
+    if cap.state != pkce.state {
+        anyhow::bail!("Sign-in could not be verified (state mismatch)");
+    }
+    finish(http, adapter, target_email, &cap.code, pkce, &redirect_uri).await
+}
+
+/// Exchange → identity → email gate → persist. Nothing is written on mismatch.
+async fn finish(
+    http: &reqwest::Client,
+    adapter: &dyn LoginAdapter,
+    expected_email: &str,
+    code: &str,
+    pkce: &Pkce,
+    redirect_uri: &str,
+) -> Result<()> {
+    let tokens = adapter.exchange(http, code, pkce, redirect_uri).await?;
+    let identity = adapter.identity(http, &tokens).await?;
+    if !email_matches(expected_email, &identity.email) {
+        anyhow::bail!(
+            "You signed in as {}, but this row is {expected_email}. \
+             Switch accounts in your browser and try again.",
+            identity.email
+        );
+    }
+    adapter.persist(expected_email, &tokens).await
+}
+
+/// Ask for the pasted code via `zenity --entry`. If zenity is absent, copy the
+/// authorize URL to the clipboard via `xclip`, notify, and give up (None).
+async fn prompt_paste(auth_url: &str) -> Option<String> {
+    let out = tokio::process::Command::new("zenity")
+        .arg("--entry")
+        .arg("--title=PitStop sign-in")
+        .arg("--text=Paste the code from your browser (authorization code, CODE#STATE, or the full redirect URL):")
+        .arg("--width=440")
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        }
+        Ok(_) => None, // user cancelled zenity
+        Err(_) => {
+            copy_to_clipboard(auth_url).await;
+            crate::notify::post(
+                "PitStop sign-in — action needed",
+                "Install `zenity` to paste the sign-in code. The sign-in URL was copied to your clipboard; approve in the browser, then retry.",
+            );
+            None
+        }
+    }
+}
+
+async fn copy_to_clipboard(text: &str) {
+    use tokio::io::AsyncWriteExt;
+    if let Ok(mut child) = tokio::process::Command::new("xclip")
+        .args(["-selection", "clipboard"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes()).await;
+            // Drop stdin to signal EOF so xclip stops reading and exits.
+            drop(stdin);
+        }
+        let _ = child.wait().await;
+    }
 }
 
 // ─── ClaudeLoginAdapter ────────────────────────────────────────────────────
@@ -530,5 +670,73 @@ mod tests {
         assert_eq!(v["tokens"]["account_id"], "acc_1"); // preserved
         assert_eq!(v["OPENAI_API_KEY"], "sk-x"); // preserved
         assert_ne!(v["last_refresh"], "2020-01-01T00:00:00.000Z"); // bumped
+    }
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct FakeAdapter {
+        identity_email: String,
+        persisted: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl LoginAdapter for FakeAdapter {
+        fn authorize_url(&self, _p: &Pkce, _r: &str, _paste: bool) -> String {
+            String::new()
+        }
+        fn fixed_loopback_port(&self) -> Option<u16> {
+            None
+        }
+        fn redirect_path(&self) -> &'static str {
+            "/callback"
+        }
+        fn supports_paste(&self) -> bool {
+            false
+        }
+        async fn exchange(
+            &self,
+            _h: &reqwest::Client,
+            _c: &str,
+            _p: &Pkce,
+            _r: &str,
+        ) -> Result<FreshTokens> {
+            Ok(FreshTokens {
+                access_token: "at".into(),
+                refresh_token: None,
+                id_token: None,
+                expires_at_ms: 0,
+            })
+        }
+        async fn identity(&self, _h: &reqwest::Client, _t: &FreshTokens) -> Result<LoginIdentity> {
+            Ok(LoginIdentity { email: self.identity_email.clone(), account_id: None })
+        }
+        async fn persist(&self, _email: &str, _t: &FreshTokens) -> Result<()> {
+            self.persisted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_persists_on_email_match() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let a = FakeAdapter { identity_email: "Me@Example.com".into(), persisted: flag.clone() };
+        let pkce = Pkce::generate();
+        finish(&reqwest::Client::new(), &a, "me@example.com", "code", &pkce, "http://localhost/callback")
+            .await
+            .unwrap();
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn finish_skips_persist_on_mismatch() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let a = FakeAdapter { identity_email: "other@example.com".into(), persisted: flag.clone() };
+        let pkce = Pkce::generate();
+        let err = finish(&reqwest::Client::new(), &a, "me@example.com", "code", &pkce, "http://x/callback")
+            .await
+            .unwrap_err();
+        assert!(!flag.load(Ordering::SeqCst));
+        assert!(err.to_string().contains("other@example.com"));
     }
 }
