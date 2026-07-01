@@ -28,6 +28,7 @@ pub struct RowView {
     pub plan_label: String,
     pub switchable: bool,
     pub switch_key: String,
+    pub login: bool,
     pub detail_lines: Vec<String>,
 }
 
@@ -127,13 +128,12 @@ impl Tray for PitStopTray {
                 };
                 let header = format!("{}  {}{}", row.marker, row.email, plan);
                 if row.switchable {
-                    items.push(send_item(
-                        format!("{header}    ⮂ switch"),
-                        true,
-                        Action::Switch {
-                            key: row.switch_key.clone(),
-                        },
-                    ));
+                    let (suffix, action) = if row.login {
+                        ("⟳ Log in again", Action::Login { key: row.switch_key.clone() })
+                    } else {
+                        ("⮂ switch", Action::Switch { key: row.switch_key.clone() })
+                    };
+                    items.push(send_item(format!("{header}    {suffix}"), true, action));
                 } else {
                     items.push(disabled(header));
                 }

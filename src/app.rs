@@ -14,6 +14,7 @@ use crate::model::{
     IndicatorMetric, IndicatorStyle, MenuAccount, MenuBarSource, Provider, Source,
 };
 use crate::notify;
+use crate::oauth::{self, LoginAdapter};
 use crate::settings::{self, Settings};
 use crate::tray::{GroupView, PitStopTray, RowView, TrayView};
 use crate::usage_api::{self, ApiError, UsageReport};
@@ -21,7 +22,7 @@ use chrono::{DateTime, Local};
 use ksni::Handle;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(120);
 
@@ -34,6 +35,8 @@ pub enum Action {
     Remove { key: String },
     OpenUrl(String),
     SetSetting(SettingChange),
+    Login { key: String },
+    LoginFinished { key: String, result: Result<(), String> },
     Quit,
 }
 
@@ -78,10 +81,13 @@ pub struct Engine {
     last_refresh: Option<DateTime<Local>>,
     last_top_level_error: Option<String>,
     next_periodic: Instant,
+
+    action_tx: UnboundedSender<Action>,
+    login_in_flight: bool,
 }
 
 impl Engine {
-    pub fn new(handle: Handle<PitStopTray>) -> Self {
+    pub fn new(handle: Handle<PitStopTray>, action_tx: UnboundedSender<Action>) -> Self {
         Engine {
             client: reqwest::Client::new(),
             handle,
@@ -102,6 +108,8 @@ impl Engine {
             last_refresh: None,
             last_top_level_error: None,
             next_periodic: Instant::now() + REFRESH_INTERVAL,
+            action_tx,
+            login_in_flight: false,
         }
     }
 
@@ -199,6 +207,29 @@ impl Engine {
             Action::SetSetting(change) => {
                 self.apply_setting(change);
                 self.render().await;
+            }
+            Action::Login { key } => {
+                self.perform_login(key).await;
+            }
+            Action::LoginFinished { key, result } => {
+                self.login_in_flight = false;
+                match result {
+                    Ok(()) => {
+                        clear_after_login(
+                            &mut self.next_fetch_allowed,
+                            &mut self.failure_count,
+                            &mut self.needs_action,
+                            &key,
+                        );
+                        notify::post("Signed in", "Re-authenticated — refreshing usage…");
+                        self.refresh_all().await;
+                        self.render().await;
+                    }
+                    Err(e) => {
+                        notify::post("Sign-in failed", &e);
+                        self.render().await;
+                    }
+                }
             }
             Action::Quit => std::process::exit(0),
         }
@@ -612,6 +643,34 @@ impl Engine {
         switched
     }
 
+    /// Kick off a native OAuth re-login for `key`'s account. Runs the browser
+    /// flow inside a detached `tokio::spawn` so the 90–180 s wait never blocks
+    /// the select loop; the outcome comes back as `Action::LoginFinished`. A
+    /// single `login_in_flight` guard rejects a second concurrent sign-in.
+    async fn perform_login(&mut self, key: String) {
+        if self.login_in_flight {
+            notify::post(
+                "Sign-in already in progress",
+                "Finish or cancel the current sign-in before starting another.",
+            );
+            return;
+        }
+        self.login_in_flight = true;
+        let (email, provider) = login_key_provider(&key);
+        let adapter: Box<dyn LoginAdapter> = match provider {
+            Provider::Codex => Box::new(oauth::CodexLoginAdapter),
+            Provider::Claude => Box::new(oauth::ClaudeLoginAdapter),
+        };
+        let http = self.client.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            let result = oauth::run_login(&http, adapter.as_ref(), &email)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Action::LoginFinished { key, result });
+        });
+    }
+
     async fn perform_switch(&mut self, email: &str, auto: bool, reason: Option<String>) {
         match self.store.switch_to(email) {
             Ok(()) => {
@@ -810,6 +869,7 @@ impl Engine {
             email: account.email.clone(),
             plan_label: account.plan_label.clone(),
             switchable: !account.is_active,
+            login: login_eligible(self.needs_action.contains(&key), account.is_active),
             switch_key: key,
             detail_lines: detail,
         }
@@ -1104,6 +1164,39 @@ fn dot(pct: Option<f64>) -> &'static str {
     }
 }
 
+/// A row shows the coral Login action instead of Switch when its key is flagged
+/// `needs_action` (token rejected) AND the row is inactive (switchable).
+pub fn login_eligible(in_needs_action: bool, is_active: bool) -> bool {
+    in_needs_action && !is_active
+}
+
+/// Split a menu key into `(email, provider)` for re-login. A `"codex:<email>"`
+/// key targets Codex with the bare email; a bare email is a Claude key used
+/// verbatim. Mirrors the `Action::Switch` key convention so `perform_login`
+/// can pick the matching `LoginAdapter`.
+fn login_key_provider(key: &str) -> (String, Provider) {
+    match key.strip_prefix("codex:") {
+        Some(email) => (email.to_string(), Provider::Codex),
+        None => (key.to_string(), Provider::Claude),
+    }
+}
+
+/// The success half of `Action::LoginFinished`: drop the Unauthorized backoff,
+/// reset the failure counter, and clear the `needs_action` flag so the row
+/// heals on the next `refresh_all`. Free function (mirroring
+/// `record_window_sample`) so the state transition is unit-testable without a
+/// live `Engine`.
+fn clear_after_login(
+    next_fetch_allowed: &mut HashMap<String, Instant>,
+    failure_count: &mut HashMap<String, u32>,
+    needs_action: &mut HashSet<String>,
+    key: &str,
+) {
+    next_fetch_allowed.remove(key);
+    failure_count.insert(key.to_string(), 0);
+    needs_action.remove(key);
+}
+
 fn pick_auto_switch(
     live: Option<&str>,
     threshold: f64,
@@ -1395,5 +1488,54 @@ mod tests {
             }
             _ => panic!("Expected Action::OpenUrl"),
         }
+    }
+
+    // ── in-app re-login (Task 8) ───────────────────────────────────────────
+
+    #[test]
+    fn login_eligible_requires_needs_action_and_inactive() {
+        assert!(login_eligible(true, false)); // flagged + inactive -> Login
+        assert!(!login_eligible(true, true)); // active row -> never
+        assert!(!login_eligible(false, false)); // not flagged -> Switch
+    }
+
+    #[test]
+    fn login_key_provider_splits_codex_prefix() {
+        // A "codex:" key resolves to Codex with the bare email; anything else
+        // is a Claude key used verbatim. This is the resolution `perform_login`
+        // uses to pick the adapter. (`Provider` has no `Debug`, so we compare
+        // with `==` rather than `assert_eq!`.)
+        let (email, provider) = login_key_provider("codex:me@x.com");
+        assert_eq!(email, "me@x.com");
+        assert!(provider == Provider::Codex);
+
+        let (email, provider) = login_key_provider("me@x.com");
+        assert_eq!(email, "me@x.com");
+        assert!(provider == Provider::Claude);
+
+        // A bare "codex:" prefix with empty email still classifies as Codex.
+        let (email, provider) = login_key_provider("codex:");
+        assert!(email.is_empty());
+        assert!(provider == Provider::Codex);
+    }
+
+    #[test]
+    fn clear_after_login_heals_row_state() {
+        // The success half of LoginFinished: drop the 1-hour Unauthorized backoff,
+        // reset the failure counter, and clear the needs_action flag so the row
+        // heals on the next refresh.
+        let mut nfa: HashMap<String, Instant> = HashMap::new();
+        let mut fc: HashMap<String, u32> = HashMap::new();
+        let mut na: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let key = "me@x.com";
+        nfa.insert(key.to_string(), Instant::now() + Duration::from_secs(3600));
+        fc.insert(key.to_string(), 5);
+        na.insert(key.to_string());
+
+        clear_after_login(&mut nfa, &mut fc, &mut na, key);
+
+        assert!(!nfa.contains_key(key), "backoff should be cleared");
+        assert_eq!(fc[key], 0, "failure count reset to zero");
+        assert!(!na.contains(key), "needs_action flag cleared");
     }
 }

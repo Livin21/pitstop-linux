@@ -7,9 +7,7 @@ mod format;
 mod icon;
 mod model;
 mod notify;
-#[allow(dead_code)] // wired into the engine in the login task
 mod loopback;
-#[allow(dead_code)] // wired into the engine in the login task
 mod oauth;
 mod secret_store;
 mod settings;
@@ -41,7 +39,7 @@ async fn run_tray() -> Result<()> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let tray = tray::PitStopTray {
         view: tray::TrayView::loading(),
-        tx,
+        tx: tx.clone(),
     };
     let handle = tray.spawn().await.map_err(|e| {
         anyhow::anyhow!(
@@ -49,7 +47,7 @@ async fn run_tray() -> Result<()> {
              On Cinnamon you may need `snixembed` or Mint's indicator support enabled."
         )
     })?;
-    app::Engine::new(handle).run(rx).await;
+    app::Engine::new(handle, tx).run(rx).await;
     Ok(())
 }
 

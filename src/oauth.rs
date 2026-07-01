@@ -547,7 +547,7 @@ mod tests {
         assert_eq!(q["code_challenge"], "CH");
         assert_eq!(q["code_challenge_method"], "S256");
         assert_eq!(q["state"], "ST");
-        assert!(q.get("code").is_none());
+        assert!(!q.contains_key("code"));
     }
 
     #[test]
