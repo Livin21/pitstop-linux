@@ -75,7 +75,7 @@ pub fn updated(date: DateTime<Local>) -> String {
 
 /// "3:40 PM" — short clock for the projection line ("on pace to hit limit ~3:40 PM").
 /// Unlike `updated`, this omits seconds.
-#[allow(dead_code)] // wired up in a later task
+#[allow(dead_code)]
 pub fn short_clock(date: DateTime<Local>) -> String {
     date.format("%-I:%M %p").to_string()
 }

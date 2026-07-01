@@ -942,6 +942,7 @@ impl Engine {
 /// Matches the Swift `slopePerSecond` in AppDelegate.swift (v0.3.1 diff).
 #[allow(dead_code)] // wired up in a later task
 fn slope_per_second(samples: &[(Instant, f64)]) -> Option<f64> {
+    if samples.len() < 2 { return None; }
     let t0 = samples[0].0;
     let xs: Vec<f64> = samples
         .iter()
@@ -1041,6 +1042,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     // ── slope_per_second ───────────────────────────────────────────────────
+
+    #[test]
+    fn slope_empty_or_single_sample_is_none() {
+        assert_eq!(slope_per_second(&[]), None);
+        let t = std::time::Instant::now();
+        assert_eq!(slope_per_second(&[(t, 5.0)]), None);
+    }
 
     #[test]
     fn slope_perfect_linear_series() {
