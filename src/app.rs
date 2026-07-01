@@ -177,7 +177,9 @@ impl Engine {
                 self.render().await;
             }
             Action::Switch { key } => {
-                if let Some(email) = key.strip_prefix("codex:") {
+                if let Some(email) = key.strip_prefix("gemini:") {
+                    self.perform_gemini_switch(email, false, None).await;
+                } else if let Some(email) = key.strip_prefix("codex:") {
                     self.perform_codex_switch(email, false, None).await;
                 } else {
                     self.perform_switch(&key.clone(), false, None).await;
@@ -791,6 +793,31 @@ impl Engine {
             switched = true;
         }
 
+        let gemini_utils: Vec<(String, Option<f64>)> = self
+            .gemini_store
+            .profiles
+            .iter()
+            .map(|p| {
+                let key = format!("gemini:{}", p.email);
+                let u = if self.fetch_error.contains_key(&key) {
+                    None
+                } else {
+                    self.gemini_usage.get(&key).map(|r| r.max_utilization())
+                };
+                (p.email.clone(), u)
+            })
+            .collect();
+        if let Some((target, reason)) = pick_auto_switch(
+            self.gemini_live_email.as_deref(),
+            threshold,
+            self.last_auto_switch.get(&Provider::Gemini).copied(),
+            &gemini_utils,
+        ) {
+            self.last_auto_switch.insert(Provider::Gemini, Instant::now());
+            self.perform_gemini_switch(&target, true, Some(reason)).await;
+            switched = true;
+        }
+
         switched
     }
 
@@ -863,6 +890,37 @@ impl Engine {
             Err(e) => {
                 self.last_top_level_error = Some(format!("Couldn't switch Codex account: {e}"));
                 notify::post("Couldn't switch Codex account", &e.to_string());
+            }
+        }
+    }
+
+    /// Make `email` the live Antigravity account. Unlike Claude/Codex, the Gemini
+    /// blob carries no email, so `gemini_store::switch_to` can't snapshot the
+    /// outgoing account itself — we do it here FIRST (capture the current live
+    /// keyring blob under the tracked live email) so the departing account's
+    /// refresh token is never stranded. `switch_to` then form-matches the live
+    /// keyring before writing the target's saved blob.
+    async fn perform_gemini_switch(&mut self, email: &str, auto: bool, reason: Option<String>) {
+        // Snapshot the outgoing live account first so its refresh token isn't stranded.
+        if let Some(live) = self.gemini_live_email.clone() {
+            if let Ok(Some(blob)) = GeminiStore::live_blob().await {
+                let plan = self.gemini_plan.get(&live).cloned().unwrap_or_default();
+                let _ = self.gemini_store.snapshot(&live, &blob, &plan);
+            }
+        }
+        match self.gemini_store.switch_to(email).await {
+            Ok(()) => {
+                self.gemini_live_email = Some(email.to_string());
+                let title = if auto {
+                    format!("Auto-switched Gemini to {email}")
+                } else {
+                    format!("Switched Gemini to {email}")
+                };
+                notify::post(&title, &gemini_switch_body(reason));
+            }
+            Err(e) => {
+                self.last_top_level_error = Some(format!("Couldn't switch Gemini account: {e}"));
+                notify::post("Couldn't switch Gemini account", &e.to_string());
             }
         }
     }
@@ -1430,6 +1488,19 @@ fn clear_after_login(
     needs_action.remove(key);
 }
 
+const GEMINI_TOS_CAVEAT: &str =
+    "Note: Antigravity's terms discourage rotating this token — switch sparingly.";
+
+/// Body text for a Gemini switch notification. Uses the auto-switch `reason` when
+/// present, otherwise the manual-switch guidance, and ALWAYS appends the ToS
+/// caveat (rotating the Antigravity token is discouraged by Google's terms).
+fn gemini_switch_body(reason: Option<String>) -> String {
+    let base = reason.unwrap_or_else(|| {
+        "New Antigravity sessions use this account. Quit and reopen Antigravity to pick it up.".into()
+    });
+    format!("{base}\n{GEMINI_TOS_CAVEAT}")
+}
+
 fn pick_auto_switch(
     live: Option<&str>,
     threshold: f64,
@@ -1772,6 +1843,74 @@ mod tests {
         // one line per window + one extras line
         assert_eq!(lines.len(), 3);
         assert!(lines.last().unwrap().contains("2.5-flash 5%"));
+    }
+
+    #[test]
+    fn gemini_switch_body_carries_tos_caveat() {
+        let body = gemini_switch_body(None);
+        assert!(body.contains("Antigravity"));
+        assert!(body.to_lowercase().contains("terms") || body.to_lowercase().contains("discourage"));
+        let custom = gemini_switch_body(Some("me@a hit 92% — moved to me@b (10% used).".into()));
+        assert!(custom.contains("moved to me@b"));
+        assert!(custom.to_lowercase().contains("discourage")); // caveat still appended
+    }
+
+    // ── pick_auto_switch (auto-switch eligibility, shared by all providers) ──
+
+    #[test]
+    fn pick_auto_switch_moves_to_coolest_saved_account_above_threshold() {
+        // Gemini-shaped inputs: the live account is over threshold; the coolest
+        // OTHER saved account below threshold wins, and the reason names it.
+        let utils = vec![
+            ("live@x".to_string(), Some(92.0)),
+            ("hot@x".to_string(), Some(80.0)),
+            ("cool@x".to_string(), Some(10.0)),
+            ("mid@x".to_string(), Some(40.0)),
+        ];
+        let (target, reason) =
+            pick_auto_switch(Some("live@x"), 75.0, None, &utils).expect("should switch");
+        assert_eq!(target, "cool@x", "picks the coolest account under threshold");
+        assert!(reason.contains("live@x hit 92%"));
+        assert!(reason.contains("moved to cool@x"));
+    }
+
+    #[test]
+    fn pick_auto_switch_respects_cooldown() {
+        // Same over-threshold live account, but a switch happened <180s ago.
+        let utils = vec![
+            ("live@x".to_string(), Some(92.0)),
+            ("cool@x".to_string(), Some(10.0)),
+        ];
+        let recent = Instant::now() - Duration::from_secs(30);
+        assert!(
+            pick_auto_switch(Some("live@x"), 75.0, Some(recent), &utils).is_none(),
+            "within the 180s cooldown, no switch"
+        );
+        // Past the cooldown, it switches again.
+        let old = Instant::now() - Duration::from_secs(200);
+        assert!(pick_auto_switch(Some("live@x"), 75.0, Some(old), &utils).is_some());
+    }
+
+    #[test]
+    fn pick_auto_switch_skips_when_live_below_threshold() {
+        let utils = vec![
+            ("live@x".to_string(), Some(50.0)),
+            ("cool@x".to_string(), Some(10.0)),
+        ];
+        assert!(
+            pick_auto_switch(Some("live@x"), 75.0, None, &utils).is_none(),
+            "live under threshold => no switch"
+        );
+    }
+
+    #[test]
+    fn pick_auto_switch_none_when_no_cooler_alternative() {
+        // Live is hot, but every other saved account is also over threshold.
+        let utils = vec![
+            ("live@x".to_string(), Some(92.0)),
+            ("also_hot@x".to_string(), Some(88.0)),
+        ];
+        assert!(pick_auto_switch(Some("live@x"), 75.0, None, &utils).is_none());
     }
 
     #[test]
