@@ -333,6 +333,19 @@ pub fn refresh_form(refresh_token: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
+/// OAuth `authorization_code` exchange fields (form-urlencoded) for Google.
+/// Consumed by `oauth::GeminiLoginAdapter::exchange` during re-login.
+pub fn exchange_form(code: &str, verifier: &str, redirect_uri: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("grant_type", "authorization_code".into()),
+        ("code", code.to_string()),
+        ("redirect_uri", redirect_uri.to_string()),
+        ("client_id", ANTIGRAVITY_CLIENT_ID.into()),
+        ("client_secret", ANTIGRAVITY_CLIENT_SECRET.into()),
+        ("code_verifier", verifier.to_string()),
+    ]
+}
+
 fn retry_after(resp: &reqwest::Response) -> Option<f64> {
     resp.headers()
         .get("retry-after")
@@ -565,6 +578,17 @@ mod tests {
         assert_eq!(pc.access_token, "new_acc");
         assert_eq!(pc.refresh_token.as_deref(), Some("1//rt")); // preserved
         assert_eq!(pc.id_token.as_deref(), Some("idt"));
+    }
+
+    #[test]
+    fn exchange_form_has_auth_code_grant() {
+        let f = exchange_form("thecode", "theverifier", "http://127.0.0.1:5123/oauth2callback");
+        assert!(f.contains(&("grant_type", "authorization_code".to_string())));
+        assert!(f.contains(&("code", "thecode".to_string())));
+        assert!(f.contains(&("code_verifier", "theverifier".to_string())));
+        assert!(f.contains(&("redirect_uri", "http://127.0.0.1:5123/oauth2callback".to_string())));
+        assert!(f.iter().any(|(k, v)| *k == "client_id" && v == ANTIGRAVITY_CLIENT_ID));
+        assert!(f.iter().any(|(k, v)| *k == "client_secret" && v == ANTIGRAVITY_CLIENT_SECRET));
     }
 
     #[test]

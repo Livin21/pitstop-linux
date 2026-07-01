@@ -838,8 +838,7 @@ impl Engine {
         let adapter: Box<dyn LoginAdapter> = match provider {
             Provider::Codex => Box::new(oauth::CodexLoginAdapter),
             Provider::Claude => Box::new(oauth::ClaudeLoginAdapter),
-            // Gemini login adapter not yet implemented; will be added in a later task.
-            Provider::Gemini => todo!("Gemini login adapter"),
+            Provider::Gemini => Box::new(oauth::GeminiLoginAdapter),
         };
         let http = self.client.clone();
         let tx = self.action_tx.clone();
@@ -1466,9 +1465,12 @@ pub fn login_eligible(in_needs_action: bool, is_active: bool) -> bool {
 /// verbatim. Mirrors the `Action::Switch` key convention so `perform_login`
 /// can pick the matching `LoginAdapter`.
 fn login_key_provider(key: &str) -> (String, Provider) {
-    match key.strip_prefix("codex:") {
-        Some(email) => (email.to_string(), Provider::Codex),
-        None => (key.to_string(), Provider::Claude),
+    if let Some(email) = key.strip_prefix("codex:") {
+        (email.to_string(), Provider::Codex)
+    } else if let Some(email) = key.strip_prefix("gemini:") {
+        (email.to_string(), Provider::Gemini)
+    } else {
+        (key.to_string(), Provider::Claude)
     }
 }
 
@@ -1821,6 +1823,11 @@ mod tests {
         let (email, provider) = login_key_provider("codex:");
         assert!(email.is_empty());
         assert!(provider == Provider::Codex);
+
+        // A "gemini:" key resolves to Gemini with the bare email.
+        let (email, provider) = login_key_provider("gemini:me@x.com");
+        assert_eq!(email, "me@x.com");
+        assert!(provider == Provider::Gemini);
     }
 
     #[test]

@@ -502,6 +502,110 @@ impl LoginAdapter for CodexLoginAdapter {
     }
 }
 
+// ─── GeminiLoginAdapter ─────────────────────────────────────────────────────
+
+const GEMINI_AUTHORIZE: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const GEMINI_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+
+/// Google installed-app login for Gemini/Antigravity. Google accepts an
+/// arbitrary loopback port → fully automatic (no paste fallback). `persist`
+/// writes ONLY the profile snapshot file, never the live keyring (shared
+/// contract). Token exchange is form-urlencoded (Google's OAuth endpoint),
+/// unlike Claude's JSON body.
+pub struct GeminiLoginAdapter;
+
+#[async_trait::async_trait]
+impl LoginAdapter for GeminiLoginAdapter {
+    fn authorize_url(&self, pkce: &Pkce, redirect_uri: &str, _paste_mode: bool) -> String {
+        let mut url = reqwest::Url::parse(GEMINI_AUTHORIZE).unwrap();
+        url.query_pairs_mut()
+            .append_pair("client_id", crate::gemini::ANTIGRAVITY_CLIENT_ID)
+            .append_pair("response_type", "code")
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("scope", crate::gemini::SCOPES)
+            .append_pair("code_challenge", &pkce.challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("state", &pkce.state)
+            .append_pair("access_type", "offline")
+            .append_pair("prompt", "consent");
+        url.to_string()
+    }
+
+    fn fixed_loopback_port(&self) -> Option<u16> {
+        None // ephemeral port; Google accepts any loopback
+    }
+
+    fn redirect_path(&self) -> &'static str {
+        "/oauth2callback"
+    }
+
+    fn supports_paste(&self) -> bool {
+        false
+    }
+
+    async fn exchange(
+        &self,
+        http: &reqwest::Client,
+        code: &str,
+        pkce: &Pkce,
+        redirect_uri: &str,
+    ) -> Result<FreshTokens> {
+        let resp = http
+            .post(GEMINI_TOKEN_URL)
+            .form(&crate::gemini::exchange_form(code, &pkce.verifier, redirect_uri))
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))?;
+        let status = resp.status().as_u16();
+        if status == 400 || status == 401 || status == 403 {
+            return Err(ApiError::Unauthorized.into());
+        }
+        if status != 200 {
+            return Err(ApiError::Http(status).into());
+        }
+        let root: Value = resp.json().await.map_err(|_| ApiError::Malformed)?;
+        let access = root
+            .get("access_token")
+            .and_then(Value::as_str)
+            .ok_or(ApiError::Malformed)?;
+        let expires_in = root
+            .get("expires_in")
+            .and_then(Value::as_f64)
+            .unwrap_or(3600.0);
+        Ok(FreshTokens {
+            access_token: access.to_string(),
+            refresh_token: root.get("refresh_token").and_then(Value::as_str).map(String::from),
+            id_token: root.get("id_token").and_then(Value::as_str).map(String::from),
+            expires_at_ms: (crate::util::now_ms() + expires_in * 1000.0) as i64,
+        })
+    }
+
+    async fn identity(&self, http: &reqwest::Client, t: &FreshTokens) -> Result<LoginIdentity> {
+        // The Antigravity blob carries no email, so identity comes from `userinfo`.
+        let email = crate::gemini::fetch_email(http, &t.access_token)
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(LoginIdentity { email, account_id: None })
+    }
+
+    async fn persist(&self, email: &str, t: &FreshTokens) -> Result<()> {
+        // Profile snapshot ONLY (never the live keyring). Build a fresh blob:
+        // unlike Claude/Codex there is nothing to patch — a re-login produces a
+        // complete fresh token set. `build_antigravity_blob` always emits the
+        // go-keyring-wrapped form; Task 5's `switch_to` form-matches it to the
+        // live keyring at switch time.
+        let iso = crate::gemini::expiry_iso(t.expires_at_ms as f64);
+        let blob = crate::gemini::build_antigravity_blob(
+            &t.access_token,
+            t.refresh_token.as_deref(),
+            t.id_token.as_deref(),
+            &iso,
+        );
+        secret_store::write(crate::gemini_store::PROVIDER, email, &blob)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,6 +774,65 @@ mod tests {
         assert_eq!(v["tokens"]["account_id"], "acc_1"); // preserved
         assert_eq!(v["OPENAI_API_KEY"], "sk-x"); // preserved
         assert_ne!(v["last_refresh"], "2020-01-01T00:00:00.000Z"); // bumped
+    }
+
+    #[test]
+    fn gemini_authorize_url_has_google_params() {
+        let pkce = Pkce { verifier: "v".into(), challenge: "chal".into(), state: "st".into() };
+        let url = GeminiLoginAdapter.authorize_url(&pkce, "http://127.0.0.1:5123/oauth2callback", false);
+        assert!(url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"));
+        assert!(url.contains("code_challenge=chal"));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("state=st"));
+        assert!(url.contains("access_type=offline"));
+        // client_id chars (`.` `-`) are unreserved, so it appears literally.
+        assert!(url.contains("client_id=1071006060591-"));
+        assert_eq!(GeminiLoginAdapter.redirect_path(), "/oauth2callback");
+        assert_eq!(GeminiLoginAdapter.fixed_loopback_port(), None);
+        assert!(!GeminiLoginAdapter.supports_paste());
+    }
+
+    #[test]
+    fn gemini_authorize_url_carries_redirect_and_scopes() {
+        let pkce = Pkce { verifier: "v".into(), challenge: "chal".into(), state: "st".into() };
+        let url = GeminiLoginAdapter.authorize_url(&pkce, "http://localhost:5123/oauth2callback", false);
+        let q = qmap(&url);
+        assert_eq!(q["response_type"], "code");
+        assert_eq!(q["redirect_uri"], "http://localhost:5123/oauth2callback");
+        assert_eq!(q["scope"], crate::gemini::SCOPES);
+        assert_eq!(q["prompt"], "consent");
+    }
+
+    #[tokio::test]
+    async fn gemini_persist_writes_only_profile_snapshot() {
+        // Writes ONLY the saved-profile snapshot file (via secret_store) — never
+        // the live keyring. The live keyring path (secret_service) is unreachable
+        // from `persist`, so a filesystem-only temp dir is a complete assertion:
+        // if persist had touched the keyring the test env has none to touch.
+        let dir = std::env::temp_dir().join("pitstop-oauth-relogin-tests");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let email = "persist-gemini@example.com";
+        // Start with no saved snapshot: persist builds a FRESH blob (unlike
+        // Claude/Codex which patch an existing profile).
+        let _ = crate::secret_store::delete(crate::gemini_store::PROVIDER, email);
+        let tokens = FreshTokens {
+            access_token: "ya29.NEW".into(),
+            refresh_token: Some("1//newR".into()),
+            id_token: Some("idt.NEW".into()),
+            expires_at_ms: 4_102_444_800_000, // 2100-01-01, safely in the future
+        };
+        GeminiLoginAdapter.persist(email, &tokens).await.unwrap();
+        let saved = crate::secret_store::read(crate::gemini_store::PROVIDER, email)
+            .unwrap()
+            .unwrap();
+        // Snapshot is the go-keyring-wrapped form (Task 5's switch form-matches it).
+        assert!(String::from_utf8_lossy(&saved).starts_with("go-keyring-base64:"));
+        // Round-trips back to the fresh tokens.
+        let creds = crate::gemini::antigravity_creds(&saved).unwrap();
+        assert_eq!(creds.access_token, "ya29.NEW");
+        assert_eq!(creds.refresh_token.as_deref(), Some("1//newR"));
+        assert_eq!(creds.id_token.as_deref(), Some("idt.NEW"));
+        crate::secret_store::delete(crate::gemini_store::PROVIDER, email).unwrap();
     }
 
     use std::sync::atomic::{AtomicBool, Ordering};
