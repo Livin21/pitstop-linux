@@ -106,8 +106,9 @@ whatever is live on each refresh:
   — switch sparingly and keep auto-switch off unless you accept that risk.**
   The **Login** action (shown on expired rows) triggers an in-app Google PKCE
   re-login flow and is a safety net for the rare case that the token expires.
-  Diagnostic: `pitstop --gemini-spike` prints the raw keyring read + Code Assist
-  probe to stdout (no GUI).
+  Diagnostic: `pitstop --gemini-spike` verifies the keyring read and Code Assist
+  probe, printing only the resolved account, plan, and per-model usage to stdout
+  (no GUI, no secrets — tokens are never printed).
 - **Secrets never leave 0600 files or the keyring.** Non-secret metadata lives
   in `~/.config/pitstop/{profiles.json,codex-profiles.json,gemini-profiles.json,settings.json}`.
 
