@@ -1,9 +1,9 @@
 # PitStop (Linux)
 
 A Linux **system-tray** app that tracks **usage limits** across your AI coding
-accounts — **Claude Code** and **OpenAI Codex** — and lets you **switch
-accounts** with one click, so when one hits its rate limit you flip to another
-and your work keeps going.
+accounts — **Claude Code**, **OpenAI Codex**, and **Google Gemini (Antigravity)**
+— and lets you **switch accounts** with one click, so when one hits its rate
+limit you flip to another and your work keeps going.
 
 This is a Rust port of the macOS [PitStop](https://github.com/Livin21/pitstop)
 menu-bar app. The tray icon shows the active Claude Code account's usage
@@ -40,6 +40,10 @@ faithful port.
     plugin, `waybar`'s tray, or `snixembed`).
 - **Claude Code** installed and logged in at least once. Optionally the
   **Codex** CLI/app signed in with a ChatGPT account.
+- **Gemini (Antigravity) provider only:** a running **Secret Service** daemon
+  (e.g. `gnome-keyring-daemon`). The Antigravity OAuth token is read from
+  and written to the GNOME keyring; if no keyring daemon is running the
+  Gemini provider will not start.
 
 ## Install
 
@@ -93,8 +97,19 @@ whatever is live on each refresh:
 - **Codex** uses `~/.codex/auth.json` (shared by the CLI and app) for identity
   and switching; usage from `chatgpt.com/backend-api/codex/usage`. Switching is
   the file analog of the Claude flow.
-- **Secrets never leave 0600 files.** Non-secret metadata lives in
-  `~/.config/pitstop/{profiles.json,codex-profiles.json,settings.json}`.
+- **Gemini (Antigravity)** reads the Antigravity OAuth token from the GNOME
+  keyring (`service=gemini, account=antigravity`, the same go-keyring blob the
+  Antigravity CLI writes). Identity is resolved via Google's `userinfo` endpoint.
+  Per-model Google Code Assist usage is shown per rate-limit window. Switching
+  an Antigravity account writes the saved token blob back into that same keyring
+  entry. **Important caveat: Antigravity's terms discourage rotating this token
+  — switch sparingly and keep auto-switch off unless you accept that risk.**
+  The **Login** action (shown on expired rows) triggers an in-app Google PKCE
+  re-login flow and is a safety net for the rare case that the token expires.
+  Diagnostic: `pitstop --gemini-spike` prints the raw keyring read + Code Assist
+  probe to stdout (no GUI).
+- **Secrets never leave 0600 files or the keyring.** Non-secret metadata lives
+  in `~/.config/pitstop/{profiles.json,codex-profiles.json,gemini-profiles.json,settings.json}`.
 
 ## Caveats
 
@@ -105,6 +120,11 @@ whatever is live on each refresh:
   row says so until you next run `codex`.
 - The usage/refresh endpoints are the same unofficial OAuth surface Claude Code
   and Codex use; if they change, update `usage_api.rs` / `codex.rs`.
+- **Gemini / Antigravity:** switching rewrites the Antigravity keyring token.
+  Google's Antigravity terms discourage rotating this token — switch between
+  Gemini accounts sparingly and leave auto-switch off unless you understand and
+  accept that caveat. The Gemini provider requires a running Secret Service
+  daemon (e.g. `gnome-keyring-daemon`); without one it silently skips Gemini.
 
 ## Development
 
@@ -114,8 +134,10 @@ Module map (each mirrors a Swift source file):
 | --- | --- |
 | `credentials.rs`, `claude_store.rs` | `Credentials.swift`, `ProfileStore.swift` |
 | `codex.rs`, `codex_store.rs` | `Codex.swift`, `CodexStore.swift` |
+| `gemini.rs`, `gemini_store.rs` | *(Linux-only)* Antigravity keyring + Code Assist usage |
 | `usage_api.rs` | `UsageAPI.swift` |
 | `app.rs` | `AppDelegate.swift` (logic half) |
 | `tray.rs`, `icon.rs` | status item + `AccountRowView.swift` |
 | `settings.rs`, `notify.rs` | `Settings*.swift`, `Notifier.swift` |
 | `secret_store.rs` | `Keychain.swift` (now file-based) |
+| `secret_service.rs` | *(Linux-only)* D-Bus Secret Service / GNOME keyring |
