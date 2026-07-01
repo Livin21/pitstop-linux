@@ -433,7 +433,16 @@ impl Engine {
     /// For Codex: every rate-limit window the API reported.
     /// Returns `(label, current_util, resets_at)` tuples, matching the
     /// per-window sample keys `"{key}#{label}"` in `usage_history`.
-    #[allow(dead_code)] // wired up in a later task
+    ///
+    /// **Precedence:** Codex usage (`codex_usage`) is checked before Claude usage
+    /// (`usage`). A key present in both maps (which shouldn't occur in practice,
+    /// since Codex keys are prefixed `"codex:"`) would be served from codex_usage.
+    /// A direct unit test of this precedence is not feasible without constructing
+    /// a full `Engine`, which requires live `reqwest::Client` and `Handle<PitStopTray>`
+    /// — types that cannot be instantiated in `#[cfg(test)]` without a running
+    /// ksni tray. The precedence is instead verified by reading the source: the
+    /// `if let Some(cu) = self.codex_usage.get(key)` early-return on line below
+    /// executes before the `self.usage.get(key)` branch.
     fn projectable_windows(
         &self,
         key: &str,
@@ -458,32 +467,33 @@ impl Engine {
         vec![]
     }
 
-    fn projected_full(&self, key: &str, current: f64, resets_at: Option<DateTime<chrono::Utc>>) -> Option<DateTime<Local>> {
-        if !self.settings.show_projection || current >= 100.0 {
+    /// The soonest "on pace to hit <window> limit" across an account's windows,
+    /// or `None` when no window is trending toward its limit before it resets.
+    /// Respects `settings.show_projection`. Matches Swift `projectionText(forKey:)`.
+    fn projection_text(&self, key: &str) -> Option<String> {
+        if !self.settings.show_projection {
             return None;
         }
-        let samples = self.usage_history.get(key)?;
-        if samples.len() < 3 {
-            return None;
-        }
-        let first = samples.first()?;
-        let last = samples.last()?;
-        let dt = last.0.duration_since(first.0).as_secs_f64();
-        if dt < 300.0 {
-            return None;
-        }
-        let rate = (last.1 - first.1) / dt;
-        if rate <= 0.0005 {
-            return None;
-        }
-        let secs_to_full = (100.0 - current) / rate;
-        if let Some(reset) = resets_at {
-            let secs_to_reset = (reset.with_timezone(&Local) - Local::now()).num_seconds() as f64;
-            if secs_to_full >= secs_to_reset {
-                return None;
+        let mut soonest: Option<(String, DateTime<Local>)> = None;
+        for (label, util, resets_at) in self.projectable_windows(key) {
+            let wkey = format!("{key}#{label}");
+            let samples = match self.usage_history.get(&wkey) {
+                Some(s) => s,
+                None => continue,
+            };
+            if let Some(date) = projected_full_from_samples(samples, util, resets_at) {
+                let is_sooner = soonest.as_ref().is_none_or(|(_, prev)| date < *prev);
+                if is_sooner {
+                    soonest = Some((label, date));
+                }
             }
         }
-        Some(Local::now() + chrono::Duration::seconds(secs_to_full as i64))
+        let (label, date) = soonest?;
+        Some(format!(
+            "↗ on pace to hit {} limit ~{}",
+            window_name(&label),
+            format::short_clock(date)
+        ))
     }
 
     fn check_thresholds(&mut self) {
@@ -744,8 +754,6 @@ impl Engine {
     fn build_row(&self, account: &MenuAccount) -> RowView {
         let key = account.key();
         let mut detail: Vec<String> = Vec::new();
-        let mut binding_util: Option<f64> = None;
-        let mut binding_reset: Option<DateTime<chrono::Utc>> = None;
         let mut data_date: Option<DateTime<Local>> = None;
 
         if account.is_codex() {
@@ -755,19 +763,9 @@ impl Engine {
                     let label = if w.label.is_empty() { "·" } else { &w.label };
                     detail.push(window_line(label, Some(w.used_percent), w.resets_at));
                 }
-                if let Some(top) = cu
-                    .windows
-                    .iter()
-                    .max_by(|a, b| a.used_percent.partial_cmp(&b.used_percent).unwrap_or(std::cmp::Ordering::Equal))
-                {
-                    binding_util = Some(top.used_percent);
-                    binding_reset = top.resets_at;
-                }
             }
         } else if let Some(report) = self.usage.get(&key) {
             data_date = Some(report.fetched_at);
-            binding_util = Some(report.max_utilization());
-            binding_reset = report.binding_window().and_then(|w| w.resets_at);
             let f5 = report.five_hour.and_then(|w| w.utilization);
             detail.push(window_line("5h", f5, report.five_hour.and_then(|w| w.resets_at)));
             let f7 = report.seven_day.and_then(|w| w.utilization);
@@ -792,11 +790,9 @@ impl Engine {
             }
         }
 
-        if let Some(util) = binding_util {
-            if !self.fetch_error.contains_key(&key) {
-                if let Some(full) = self.projected_full(&key, util, binding_reset) {
-                    detail.push(format!("       ↗ on pace to hit limit ~{}", format::updated(full)));
-                }
+        if !self.fetch_error.contains_key(&key) {
+            if let Some(text) = self.projection_text(&key) {
+                detail.push(format!("       {text}"));
             }
         }
 
@@ -972,6 +968,50 @@ impl Engine {
     }
 }
 
+/// Projected local time when one rate-limit window reaches 100 % at its current
+/// least-squares pace. Returns `None` when any gate fails:
+///   - current ≥ 100 %
+///   - fewer than 4 samples
+///   - span of samples < 600 s
+///   - least-squares slope ≤ 0.0005 %/s  (flat or not rising meaningfully)
+///   - secs_to_full ≤ 0  (already at or past 100 %)
+///   - projected time is at or after `resets_at` (window resets first)
+///
+/// Matches the Swift `projectedFull(samples:current:resetsAt:)` gate set
+/// introduced in PitStop macOS v0.3.1.
+fn projected_full_from_samples(
+    samples: &[(Instant, f64)],
+    current: f64,
+    resets_at: Option<DateTime<chrono::Utc>>,
+) -> Option<DateTime<Local>> {
+    if current >= 100.0 || samples.len() < 4 {
+        return None;
+    }
+    let span = samples
+        .last()?
+        .0
+        .duration_since(samples.first()?.0)
+        .as_secs_f64();
+    if span < 600.0 {
+        return None;
+    }
+    let rate = slope_per_second(samples)?;
+    if rate <= 0.0005 {
+        return None;
+    }
+    let secs_to_full = (100.0 - current) / rate;
+    if secs_to_full <= 0.0 {
+        return None;
+    }
+    let projected = Local::now() + chrono::Duration::seconds(secs_to_full as i64);
+    if let Some(reset) = resets_at {
+        if projected >= reset.with_timezone(&Local) {
+            return None;
+        }
+    }
+    Some(projected)
+}
+
 /// Append one (timestamp, utilisation) sample to the per-window history,
 /// pruning entries older than 30 min and clearing all entries when a window
 /// appears to have reset (utilisation dropped by more than 2.0 points).
@@ -996,7 +1036,6 @@ fn record_window_sample(
 /// Least-squares slope (utilisation % per second) over time-stamped samples.
 /// Returns `None` when all samples share the same timestamp (degenerate).
 /// Matches the Swift `slopePerSecond` in AppDelegate.swift (v0.3.1 diff).
-#[allow(dead_code)] // wired up in a later task
 fn slope_per_second(samples: &[(Instant, f64)]) -> Option<f64> {
     if samples.len() < 2 { return None; }
     let t0 = samples[0].0;
@@ -1020,7 +1059,6 @@ fn slope_per_second(samples: &[(Instant, f64)]) -> Option<f64> {
 
 /// Human-readable name for a rate-limit window label used in the projection
 /// line: "5-hour", "weekly", "monthly", or the raw label for anything else.
-#[allow(dead_code)] // wired up in a later task
 fn window_name(label: &str) -> String {
     match label {
         "5h"  => "5-hour".into(),
@@ -1221,5 +1259,109 @@ mod tests {
         record_window_sample(&mut h, "k#5h", 20.0, now);
         // The old entry is 1801 s before `now`; retain condition: now.duration_since(t) <= 1800
         assert_eq!(h["k#5h"].len(), 1, "old sample should have been pruned");
+    }
+
+    /// Extra hardening (Task 3): verify that `record_window_sample` stores the
+    /// sample under the exact composite key produced by the production keying
+    /// path (`"{account_key}#{label}"`), not just that the format! macro
+    /// produces that string.
+    #[test]
+    fn record_window_sample_produces_exact_key() {
+        let mut h: History = HashMap::new();
+        let now = Instant::now();
+        record_window_sample(&mut h, "codex:me@x#7d", 42.0, now);
+        assert!(
+            h.contains_key("codex:me@x#7d"),
+            "expected key \"codex:me@x#7d\" in history map, got: {:?}",
+            h.keys().collect::<Vec<_>>()
+        );
+    }
+
+    use chrono::Utc;
+
+    // ── projected_full_from_samples (gate checks) ──────────────────────────
+
+    /// Helper: 4 evenly-spaced samples with a 0.1 /s slope and ≥600 s span.
+    fn rising_samples(t0: Instant) -> Vec<(Instant, f64)> {
+        // xs=[0,200,400,600] ys=[10,30,50,70]  slope=0.1/s  span=600s
+        vec![
+            (t0,                            10.0),
+            (t0 + Duration::from_secs(200), 30.0),
+            (t0 + Duration::from_secs(400), 50.0),
+            (t0 + Duration::from_secs(600), 70.0),
+        ]
+    }
+
+    #[test]
+    fn gate_fewer_than_4_samples_returns_none() {
+        let t0 = Instant::now();
+        let three = vec![
+            (t0,                            10.0),
+            (t0 + Duration::from_secs(300), 25.0),
+            (t0 + Duration::from_secs(700), 40.0),
+        ];
+        assert!(projected_full_from_samples(&three, 40.0, None).is_none());
+    }
+
+    #[test]
+    fn gate_span_under_600s_returns_none() {
+        let t0 = Instant::now();
+        // 4 samples but only 599 s span
+        let samples = vec![
+            (t0,                            10.0),
+            (t0 + Duration::from_secs(199), 30.0),
+            (t0 + Duration::from_secs(399), 50.0),
+            (t0 + Duration::from_secs(599), 70.0),
+        ];
+        assert!(projected_full_from_samples(&samples, 70.0, None).is_none());
+    }
+
+    #[test]
+    fn gate_current_at_100_returns_none() {
+        let t0 = Instant::now();
+        let samples = rising_samples(t0);
+        assert!(projected_full_from_samples(&samples, 100.0, None).is_none());
+    }
+
+    #[test]
+    fn gate_slope_below_threshold_returns_none() {
+        // slope = 0.006 / 600 = 0.00001 /s  (well below 0.0005 gate)
+        let t0 = Instant::now();
+        let samples = vec![
+            (t0,                            10.000),
+            (t0 + Duration::from_secs(200), 10.002),
+            (t0 + Duration::from_secs(400), 10.004),
+            (t0 + Duration::from_secs(600), 10.006),
+        ];
+        assert!(projected_full_from_samples(&samples, 10.006, None).is_none());
+    }
+
+    #[test]
+    fn gate_resets_before_full_returns_none() {
+        let t0 = Instant::now();
+        let samples = rising_samples(t0);
+        // slope≈0.1/s  current=70  secs_to_full≈300s
+        // resets in 10 s → window resets before it fills → None
+        let resets_soon = Some(Utc::now() + chrono::Duration::seconds(10));
+        assert!(projected_full_from_samples(&samples, 70.0, resets_soon).is_none());
+    }
+
+    #[test]
+    fn all_gates_pass_returns_some() {
+        let t0 = Instant::now();
+        let samples = rising_samples(t0);
+        // slope=0.1/s, current=70, span=600s, 4 samples, no resets_at → Some
+        let result = projected_full_from_samples(&samples, 70.0, None);
+        assert!(result.is_some(), "all gates passed — expected Some, got None");
+    }
+
+    #[test]
+    fn all_gates_pass_resets_after_full_returns_some() {
+        let t0 = Instant::now();
+        let samples = rising_samples(t0);
+        // secs_to_full ≈ 300s; reset in 3600s (well after full) → Some
+        let resets_later = Some(Utc::now() + chrono::Duration::seconds(3600));
+        let result = projected_full_from_samples(&samples, 70.0, resets_later);
+        assert!(result.is_some(), "resets after full → should project");
     }
 }
