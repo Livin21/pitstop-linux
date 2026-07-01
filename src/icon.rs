@@ -84,6 +84,7 @@ pub fn render(pct: Option<i64>, stale: bool, style: IndicatorStyle) -> IconImage
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_text_centered(
     buf: &mut [u8],
     img_w: i32,
@@ -164,6 +165,7 @@ fn draw_checker_strip(buf: &mut [u8], w: i32, h: i32, color: [u8; 3], alpha: f32
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fill_rect(buf: &mut [u8], w: i32, h: i32, x: i32, y: i32, rw: i32, rh: i32, color: [u8; 3], a: f32) {
     for yy in y..(y + rh) {
         for xx in x..(x + rw) {

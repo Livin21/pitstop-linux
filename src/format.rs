@@ -72,3 +72,30 @@ pub fn relative_short(seconds: f64) -> String {
 pub fn updated(date: DateTime<Local>) -> String {
     date.format("%-I:%M:%S %p").to_string()
 }
+
+/// "3:40 PM" — short clock for the projection line ("on pace to hit limit ~3:40 PM").
+/// Unlike `updated`, this omits seconds.
+#[allow(dead_code)] // wired up in a later task
+pub fn short_clock(date: DateTime<Local>) -> String {
+    date.format("%-I:%M %p").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_clock_has_one_colon_and_am_pm() {
+        let dt = chrono::Local::now();
+        let s = short_clock(dt);
+        assert!(
+            s.ends_with("AM") || s.ends_with("PM"),
+            "short_clock should end with AM or PM, got: {s}"
+        );
+        assert_eq!(
+            s.matches(':').count(),
+            1,
+            "short_clock must have exactly one colon (H:MM), got: {s}"
+        );
+    }
+}

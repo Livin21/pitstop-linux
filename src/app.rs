@@ -157,7 +157,7 @@ impl Engine {
             }
             Action::Switch { key } => {
                 if let Some(email) = key.strip_prefix("codex:") {
-                    self.perform_codex_switch(&email.to_string(), false, None).await;
+                    self.perform_codex_switch(email, false, None).await;
                 } else {
                     self.perform_switch(&key.clone(), false, None).await;
                 }
@@ -847,7 +847,7 @@ impl Engine {
             MenuBarSource::MostUrgent => {
                 let mut best: Option<(String, f64, bool)> = None;
                 let mut consider = |name: String, util: f64, stale: bool| {
-                    if best.as_ref().map_or(true, |b| util > b.1) {
+                    if best.as_ref().is_none_or(|b| util > b.1) {
                         best = Some((name, util, stale));
                     }
                 };
@@ -937,6 +937,42 @@ impl Engine {
     }
 }
 
+/// Least-squares slope (utilisation % per second) over time-stamped samples.
+/// Returns `None` when all samples share the same timestamp (degenerate).
+/// Matches the Swift `slopePerSecond` in AppDelegate.swift (v0.3.1 diff).
+#[allow(dead_code)] // wired up in a later task
+fn slope_per_second(samples: &[(Instant, f64)]) -> Option<f64> {
+    let t0 = samples[0].0;
+    let xs: Vec<f64> = samples
+        .iter()
+        .map(|(t, _)| t.duration_since(t0).as_secs_f64())
+        .collect();
+    let ys: Vec<f64> = samples.iter().map(|(_, u)| *u).collect();
+    let n = samples.len() as f64;
+    let mean_x = xs.iter().sum::<f64>() / n;
+    let mean_y = ys.iter().sum::<f64>() / n;
+    let mut num = 0.0_f64;
+    let mut den = 0.0_f64;
+    for i in 0..samples.len() {
+        let dx = xs[i] - mean_x;
+        num += dx * (ys[i] - mean_y);
+        den += dx * dx;
+    }
+    if den > 0.0 { Some(num / den) } else { None }
+}
+
+/// Human-readable name for a rate-limit window label used in the projection
+/// line: "5-hour", "weekly", "monthly", or the raw label for anything else.
+#[allow(dead_code)] // wired up in a later task
+fn window_name(label: &str) -> String {
+    match label {
+        "5h"  => "5-hour".into(),
+        "7d"  => "weekly".into(),
+        "30d" => "monthly".into(),
+        other => other.to_string(),
+    }
+}
+
 fn window_line(label: &str, pct: Option<f64>, resets_at: Option<DateTime<chrono::Utc>>) -> String {
     format!(
         "     {:<3} {} {}  {:>4}   {}",
@@ -997,4 +1033,71 @@ fn pick_auto_switch(
         target.1.round() as i64
     );
     Some((target.0, reason))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    // ── slope_per_second ───────────────────────────────────────────────────
+
+    #[test]
+    fn slope_perfect_linear_series() {
+        // xs = [0, 200, 400, 600], ys = [10, 30, 50, 70]
+        // meanX=300, meanY=40
+        // num = (-300)(-30)+(-100)(-10)+(100)(10)+(300)(30) = 9000+1000+1000+9000 = 20000
+        // den = 90000+10000+10000+90000 = 200000  =>  slope = 0.1 /s
+        let t0 = Instant::now();
+        let samples = vec![
+            (t0, 10.0_f64),
+            (t0 + Duration::from_secs(200), 30.0),
+            (t0 + Duration::from_secs(400), 50.0),
+            (t0 + Duration::from_secs(600), 70.0),
+        ];
+        let s = slope_per_second(&samples).expect("should return Some for a rising series");
+        assert!((s - 0.1).abs() < 1e-9, "expected 0.1 /s, got {s}");
+    }
+
+    #[test]
+    fn slope_degenerate_all_same_instant() {
+        let t0 = Instant::now();
+        let samples = vec![
+            (t0, 10.0_f64),
+            (t0, 20.0),
+            (t0, 30.0),
+            (t0, 40.0),
+        ];
+        assert!(slope_per_second(&samples).is_none(), "all same instant => den==0 => None");
+    }
+
+    #[test]
+    fn slope_flat_series_is_zero() {
+        let t0 = Instant::now();
+        let samples = vec![
+            (t0, 42.0_f64),
+            (t0 + Duration::from_secs(200), 42.0),
+            (t0 + Duration::from_secs(400), 42.0),
+            (t0 + Duration::from_secs(600), 42.0),
+        ];
+        // num = 0 (all yi == meanY) ; den > 0  =>  slope == 0.0
+        let s = slope_per_second(&samples).expect("den > 0 for different timestamps");
+        assert!(s.abs() < 1e-12, "flat series => slope == 0");
+    }
+
+    // ── window_name ────────────────────────────────────────────────────────
+
+    #[test]
+    fn window_name_known_labels() {
+        assert_eq!(window_name("5h"),  "5-hour");
+        assert_eq!(window_name("7d"),  "weekly");
+        assert_eq!(window_name("30d"), "monthly");
+    }
+
+    #[test]
+    fn window_name_unknown_label_passthrough() {
+        assert_eq!(window_name("14d"), "14d");
+        assert_eq!(window_name("1h"),  "1h");
+        assert_eq!(window_name(""),    "");
+    }
 }
