@@ -94,6 +94,29 @@ impl Usage {
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
     }
+
+    /// Up-to-2 most-used models after the binding one (highest), dropping <0.5%.
+    /// Returns `None` when there are no qualifying extras.
+    pub fn extras_line(&self) -> Option<String> {
+        let mut sorted: Vec<&UsageWindow> = self.windows.iter().collect();
+        sorted.sort_by(|a, b| {
+            b.used_percent
+                .partial_cmp(&a.used_percent)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let extras: Vec<String> = sorted
+            .into_iter()
+            .skip(1) // drop the binding (highest)
+            .filter(|w| w.used_percent >= 0.5)
+            .take(2)
+            .map(|w| format!("{} {}%", w.label, w.used_percent.round() as i64))
+            .collect();
+        if extras.is_empty() {
+            None
+        } else {
+            Some(extras.join(" · "))
+        }
+    }
 }
 
 /// The Antigravity keyring value is `"go-keyring-base64:" + base64(JSON)`.
@@ -175,6 +198,67 @@ pub fn parse_quota(data: &[u8]) -> Usage {
     Usage {
         windows,
         fetched_at: Local::now(),
+    }
+}
+
+/// Build a fresh Antigravity go-keyring blob (used by re-login persist).
+/// Always produces the `go-keyring-base64:`-wrapped form (the portable form).
+#[allow(dead_code)] // consumed by the re-login flow (Task 2+)
+pub fn build_antigravity_blob(
+    access: &str,
+    refresh: Option<&str>,
+    id_token: Option<&str>,
+    expiry_iso: &str,
+) -> Vec<u8> {
+    let mut token = serde_json::Map::new();
+    token.insert("access_token".into(), json!(access));
+    token.insert("token_type".into(), json!("Bearer"));
+    token.insert("expiry".into(), json!(expiry_iso));
+    if let Some(r) = refresh {
+        token.insert("refresh_token".into(), json!(r));
+    }
+    if let Some(i) = id_token {
+        token.insert("id_token".into(), json!(i));
+    }
+    let inner = json!({ "token": Value::Object(token), "auth_method": "consumer" });
+    encode_go_keyring(&serde_json::to_vec(&inner).unwrap_or_default()).into_bytes()
+}
+
+/// Patch an existing Antigravity blob in place, preserving every other field
+/// (notably `refresh_token`) and the blob's original form:
+///
+/// - if `old` started with `go-keyring-base64:`, the result is wrapped the same way.
+/// - if `old` was raw JSON (the live form on this machine), the result stays raw JSON.
+///
+/// Never log the blob or token fields.
+#[allow(dead_code)] // consumed by the re-login flow (Task 2+)
+pub fn patch_antigravity_blob(
+    old: &[u8],
+    access: &str,
+    id_token: Option<&str>,
+    expiry_iso: &str,
+) -> Option<Vec<u8>> {
+    let raw = std::str::from_utf8(old).ok()?;
+    let is_wrapped = raw.trim().starts_with(GO_KEYRING_PREFIX);
+    let inner = if is_wrapped {
+        decode_go_keyring(raw)?
+    } else {
+        raw.trim().as_bytes().to_vec()
+    };
+    let mut root: Value = serde_json::from_slice(&inner).ok()?;
+    {
+        let tok = root.get_mut("token")?.as_object_mut()?;
+        tok.insert("access_token".into(), json!(access));
+        tok.insert("expiry".into(), json!(expiry_iso));
+        if let Some(i) = id_token {
+            tok.insert("id_token".into(), json!(i));
+        }
+    }
+    let serialized = serde_json::to_vec(&root).ok()?;
+    if is_wrapped {
+        Some(encode_go_keyring(&serialized).into_bytes())
+    } else {
+        Some(serialized)
     }
 }
 
@@ -410,5 +494,52 @@ mod tests {
         let (proj2, plan2) = parse_load_code_assist(d2);
         assert!(proj2.is_none());
         assert_eq!(plan2, "Code Assist");
+    }
+
+    #[test]
+    fn build_and_patch_antigravity_blob_preserve_prefix_and_fields() {
+        let built = build_antigravity_blob("acc", Some("rt"), None, "2026-07-01T20:00:00.000Z");
+        let s = String::from_utf8(built.clone()).unwrap();
+        assert!(s.starts_with("go-keyring-base64:"));
+        let c = antigravity_creds(&built).unwrap();
+        assert_eq!(c.access_token, "acc");
+        assert_eq!(c.refresh_token.as_deref(), Some("rt"));
+
+        let patched = patch_antigravity_blob(&built, "newacc", Some("idt"), "2026-08-01T00:00:00.000Z").unwrap();
+        let ps = String::from_utf8(patched.clone()).unwrap();
+        assert!(ps.starts_with("go-keyring-base64:"));
+        let pc = antigravity_creds(&patched).unwrap();
+        assert_eq!(pc.access_token, "newacc");
+        assert_eq!(pc.refresh_token.as_deref(), Some("rt")); // preserved from old blob
+        assert_eq!(pc.id_token.as_deref(), Some("idt"));
+    }
+
+    #[test]
+    fn patch_antigravity_blob_raw_json_preserves_form() {
+        // On this machine the real blob is stored as raw JSON (no go-keyring-base64: prefix).
+        // patch must return raw JSON, NOT wrap it.
+        let raw = br#"{"token":{"access_token":"old_acc","refresh_token":"1//rt","expiry":"2026-07-01T20:00:00Z","token_type":"Bearer"},"auth_method":"consumer"}"#;
+        let patched = patch_antigravity_blob(raw, "new_acc", Some("idt"), "2026-08-01T00:00:00.000Z").unwrap();
+        let s = String::from_utf8(patched.clone()).unwrap();
+        assert!(!s.starts_with("go-keyring-base64:"), "raw JSON input must NOT be wrapped");
+        let pc = antigravity_creds(&patched).unwrap();
+        assert_eq!(pc.access_token, "new_acc");
+        assert_eq!(pc.refresh_token.as_deref(), Some("1//rt")); // preserved
+        assert_eq!(pc.id_token.as_deref(), Some("idt"));
+    }
+
+    #[test]
+    fn extras_line_drops_binding_and_zero() {
+        let u = Usage {
+            windows: vec![
+                UsageWindow { label: "3-pro".into(), used_percent: 22.0, resets_at: None },
+                UsageWindow { label: "2.5-flash".into(), used_percent: 5.0, resets_at: None },
+                UsageWindow { label: "nano".into(), used_percent: 0.0, resets_at: None },
+            ],
+            fetched_at: Local::now(),
+        };
+        assert_eq!(u.extras_line().as_deref(), Some("2.5-flash 5%"));
+        let empty = Usage { windows: vec![], fetched_at: Local::now() };
+        assert_eq!(empty.extras_line(), None);
     }
 }
