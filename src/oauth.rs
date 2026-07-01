@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
+use crate::codex;
 use crate::credentials;
 use crate::secret_store;
 use crate::usage_api::ApiError;
@@ -269,6 +270,98 @@ impl LoginAdapter for ClaudeLoginAdapter {
     }
 }
 
+// ─── CodexLoginAdapter ────────────────────────────────────────────────────────
+
+const CODEX_AUTHORIZE: &str = "https://auth.openai.com/oauth/authorize";
+const CODEX_SCOPES: &str =
+    "openid profile email offline_access api.connectors.read api.connectors.invoke";
+
+pub struct CodexLoginAdapter;
+
+#[async_trait::async_trait]
+impl LoginAdapter for CodexLoginAdapter {
+    fn authorize_url(&self, pkce: &Pkce, redirect_uri: &str, _paste_mode: bool) -> String {
+        let mut url = reqwest::Url::parse(CODEX_AUTHORIZE).unwrap();
+        url.query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", codex::CLIENT_ID)
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("scope", CODEX_SCOPES)
+            .append_pair("code_challenge", &pkce.challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("id_token_add_organizations", "true")
+            .append_pair("codex_cli_simplified_flow", "true")
+            .append_pair("originator", "codex_cli_rs")
+            .append_pair("state", &pkce.state);
+        url.to_string()
+    }
+
+    fn fixed_loopback_port(&self) -> Option<u16> {
+        Some(1455)
+    }
+
+    fn redirect_path(&self) -> &'static str {
+        "/auth/callback"
+    }
+
+    fn supports_paste(&self) -> bool {
+        false
+    }
+
+    async fn exchange(
+        &self,
+        http: &reqwest::Client,
+        code: &str,
+        pkce: &Pkce,
+        redirect_uri: &str,
+    ) -> Result<FreshTokens> {
+        let r = codex::exchange_code(http, code, &pkce.verifier, redirect_uri).await?;
+        // Expiry is carried in the id_token `exp` claim; derive it if present.
+        let expires_at_ms = r
+            .id_token
+            .as_deref()
+            .and_then(|idt| {
+                // Decode without verifying to read `exp` (seconds).
+                let payload = idt.split('.').nth(1)?;
+                let bytes =
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
+                let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+                let exp = v.get("exp")?.as_i64()?;
+                Some(exp * 1000)
+            })
+            .unwrap_or(0);
+        Ok(FreshTokens {
+            access_token: r.access_token,
+            refresh_token: r.refresh_token,
+            id_token: r.id_token,
+            expires_at_ms,
+        })
+    }
+
+    async fn identity(&self, _http: &reqwest::Client, t: &FreshTokens) -> Result<LoginIdentity> {
+        let idt = t
+            .id_token
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Codex sign-in returned no id_token"))?;
+        let (email, account_id) = codex::identity_from_id_token(idt)
+            .ok_or_else(|| anyhow::anyhow!("Could not read Codex identity from id_token"))?;
+        Ok(LoginIdentity { email, account_id })
+    }
+
+    async fn persist(&self, email: &str, t: &FreshTokens) -> Result<()> {
+        let old = secret_store::read(codex::PROVIDER, email)?
+            .ok_or_else(|| anyhow::anyhow!("No saved Codex profile for {email}"))?;
+        let refreshed = codex::Refreshed {
+            access_token: t.access_token.clone(),
+            refresh_token: t.refresh_token.clone(),
+            id_token: t.id_token.clone(),
+        };
+        let patched = codex::patching(&old, &refreshed)
+            .ok_or_else(|| anyhow::anyhow!("Could not patch Codex credentials"))?;
+        secret_store::write(codex::PROVIDER, email, &codex::normalized_blob(&patched))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +485,50 @@ mod tests {
         assert_eq!(v["claudeAiOauth"]["subscriptionType"], "max");
         assert_eq!(v["claudeAiOauth"]["rateLimitTier"], "default_claude_max_20x");
         assert_eq!(v["mcpOAuth"]["keep"], "me"); // untouched
+    }
+
+    #[test]
+    fn codex_authorize_url_params() {
+        let pkce = Pkce { verifier: "v".into(), challenge: "CH".into(), state: "ST".into() };
+        let url =
+            CodexLoginAdapter.authorize_url(&pkce, "http://localhost:1455/auth/callback", false);
+        assert!(url.starts_with("https://auth.openai.com/oauth/authorize?"));
+        let q = qmap(&url);
+        assert_eq!(q["client_id"], "app_EMoamEEZ73f0CkXaXp7hrann");
+        assert_eq!(q["response_type"], "code");
+        assert_eq!(q["redirect_uri"], "http://localhost:1455/auth/callback");
+        assert_eq!(q["code_challenge_method"], "S256");
+        assert_eq!(q["id_token_add_organizations"], "true");
+        assert_eq!(q["codex_cli_simplified_flow"], "true");
+        assert_eq!(q["originator"], "codex_cli_rs");
+        assert_eq!(q["state"], "ST");
+    }
+
+    #[tokio::test]
+    async fn codex_persist_stays_compact_and_preserves_fields() {
+        // Same shared fixed dir as the Claude persist test (see note there).
+        let dir = std::env::temp_dir().join("pitstop-oauth-relogin-tests");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let email = "persist-codex@example.com";
+        let old = br#"{"OPENAI_API_KEY":"sk-x","last_refresh":"2020-01-01T00:00:00.000Z","tokens":{"access_token":"old","account_id":"acc_1","id_token":"oldI","refresh_token":"oldR"}}"#;
+        crate::secret_store::write(crate::codex::PROVIDER, email, old).unwrap();
+        let tokens = FreshTokens {
+            access_token: "newA".into(),
+            refresh_token: Some("newR".into()),
+            id_token: Some("newI".into()),
+            expires_at_ms: 0,
+        };
+        CodexLoginAdapter.persist(email, &tokens).await.unwrap();
+        let saved =
+            crate::secret_store::read(crate::codex::PROVIDER, email).unwrap().unwrap();
+        let text = String::from_utf8(saved.clone()).unwrap();
+        assert!(!text.contains(": ")); // compact, no pretty spaces
+        let v: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(v["tokens"]["access_token"], "newA");
+        assert_eq!(v["tokens"]["refresh_token"], "newR");
+        assert_eq!(v["tokens"]["id_token"], "newI");
+        assert_eq!(v["tokens"]["account_id"], "acc_1"); // preserved
+        assert_eq!(v["OPENAI_API_KEY"], "sk-x"); // preserved
+        assert_ne!(v["last_refresh"], "2020-01-01T00:00:00.000Z"); // bumped
     }
 }

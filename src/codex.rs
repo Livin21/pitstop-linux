@@ -15,9 +15,9 @@ use std::fmt;
 use std::time::Duration;
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/codex/usage";
-const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// Codex CLI's public OAuth client (the `aud` claim of its id_token).
-const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 pub const PROVIDER: &str = "codex";
 
@@ -241,6 +241,69 @@ pub fn patching(blob: &[u8], refreshed: &Refreshed) -> Option<Vec<u8>> {
     serde_json::to_vec(&root).ok()
 }
 
+/// Exchange an authorization code for Codex tokens. Form-urlencoded, no `state`
+/// in the body — the shape the Codex CLI uses. Used only for re-login.
+pub async fn exchange_code(
+    client: &reqwest::Client,
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+) -> Result<Refreshed, CodexError> {
+    let params = [
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+        ("client_id", CLIENT_ID),
+        ("code_verifier", verifier),
+    ];
+    let resp = client
+        .post(TOKEN_URL)
+        .form(&params)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|_| CodexError::Malformed)?;
+    let status = resp.status().as_u16();
+    if status == 400 || status == 401 || status == 403 {
+        return Err(CodexError::SessionExpired);
+    }
+    if status != 200 {
+        return Err(CodexError::Malformed);
+    }
+    let root: Value = resp.json().await.map_err(|_| CodexError::Malformed)?;
+    let access = root
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or(CodexError::Malformed)?;
+    Ok(Refreshed {
+        access_token: access.to_string(),
+        refresh_token: root.get("refresh_token").and_then(Value::as_str).map(String::from),
+        id_token: root.get("id_token").and_then(Value::as_str).map(String::from),
+    })
+}
+
+/// Decode identity (email + ChatGPT account id) from an id_token JWT.
+/// Returns `(email, Option<account_id>)`, or `None` if the JWT cannot be parsed.
+pub fn identity_from_id_token(id_token: &str) -> Option<(String, Option<String>)> {
+    let claims = decode_jwt_claims(id_token)?;
+    let email = claims
+        .get("email")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            claims
+                .get("https://api.openai.com/profile")
+                .and_then(|p| p.get("email"))
+                .and_then(Value::as_str)
+        })?
+        .to_string();
+    let account_id = claims
+        .get("https://api.openai.com/auth")
+        .and_then(|a| a.get("chatgpt_account_id"))
+        .and_then(Value::as_str)
+        .map(String::from);
+    Some((email, account_id))
+}
+
 fn parse_usage(data: &[u8]) -> Result<Usage, CodexError> {
     let root: Value = serde_json::from_slice(data).map_err(|_| CodexError::Malformed)?;
     let mut windows = Vec::new();
@@ -287,4 +350,37 @@ fn window_label(seconds: i64) -> String {
         return format!("{}h", seconds / 3600);
     }
     format!("{}m", seconds / 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn make_jwt(claims: serde_json::Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        format!("{header}.{payload}.")
+    }
+
+    #[test]
+    fn identity_from_id_token_reads_email_and_account() {
+        let jwt = make_jwt(json!({
+            "email": "me@example.com",
+            "https://api.openai.com/auth": { "chatgpt_account_id": "acc_123" }
+        }));
+        let (email, acc) = identity_from_id_token(&jwt).unwrap();
+        assert_eq!(email, "me@example.com");
+        assert_eq!(acc.as_deref(), Some("acc_123"));
+    }
+
+    #[test]
+    fn identity_from_id_token_falls_back_to_profile_email() {
+        let jwt = make_jwt(json!({
+            "https://api.openai.com/profile": { "email": "p@example.com" }
+        }));
+        let (email, acc) = identity_from_id_token(&jwt).unwrap();
+        assert_eq!(email, "p@example.com");
+        assert!(acc.is_none());
+    }
 }
