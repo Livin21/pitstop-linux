@@ -4,11 +4,13 @@ mod codex;
 mod codex_store;
 mod credentials;
 mod format;
+mod gemini;
 mod icon;
 mod model;
 mod notify;
 mod loopback;
 mod oauth;
+mod secret_service;
 mod secret_store;
 mod settings;
 mod tray;
@@ -22,6 +24,10 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--check") {
         check().await;
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--gemini-spike") {
+        gemini_spike().await;
         return Ok(());
     }
     if let Some(i) = args.iter().position(|a| a == "--export-icon") {
@@ -116,6 +122,80 @@ async fn check() {
                 Err(e) => println!("   error: {e}"),
             }
         }
+    }
+}
+
+/// `pitstop --gemini-spike` — GATE for Feature 4. Prove we can read the
+/// Antigravity keyring item, decode it, resolve the email, and drive Code
+/// Assist. Any `FAIL:` line means PAUSE Feature 4 (the other plans still ship).
+async fn gemini_spike() {
+    println!("== Gemini/Antigravity spike (Feature 4 gate) ==");
+    let raw = match secret_service::get("gemini", "antigravity").await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            println!("FAIL: no keyring item service=gemini account=antigravity — PAUSE Feature 4");
+            return;
+        }
+        Err(e) => {
+            println!("FAIL: keyring read error: {e} — PAUSE Feature 4");
+            return;
+        }
+    };
+    println!(
+        "keyring value uses go-keyring-base64 wrapper: {} (unwrapped raw JSON is also accepted)",
+        raw.starts_with("go-keyring-base64:")
+    );
+    let Some(creds) = gemini::antigravity_creds(raw.as_bytes()) else {
+        println!("FAIL: could not decode go-keyring blob — PAUSE Feature 4");
+        return;
+    };
+    let client = reqwest::Client::new();
+    let access = if creds.is_expired() {
+        println!("access token expired — refreshing in memory…");
+        match &creds.refresh_token {
+            Some(rt) => match gemini::refresh(&client, rt).await {
+                Ok(r) => {
+                    println!("refresh OK (new access_token len {})", r.access_token.len());
+                    r.access_token
+                }
+                Err(e) => {
+                    println!("FAIL: refresh: {e} — PAUSE Feature 4");
+                    return;
+                }
+            },
+            None => {
+                println!("FAIL: token expired and no refresh_token — PAUSE Feature 4");
+                return;
+            }
+        }
+    } else {
+        println!("access token still valid (len {})", creds.access_token.len());
+        creds.access_token.clone()
+    };
+    match gemini::fetch_email(&client, &access).await {
+        Ok(email) => println!("userinfo email: {email}"),
+        Err(e) => {
+            println!("FAIL: userinfo: {e} — PAUSE Feature 4");
+            return;
+        }
+    }
+    match gemini::load_project(&client, &access).await {
+        Ok((Some(project), plan)) => {
+            println!("loadCodeAssist project: {project}  plan: {plan}");
+            match gemini::fetch_usage(&client, &access, &project).await {
+                Ok(u) => {
+                    println!("PASS: retrieveUserQuota returned {} buckets", u.windows.len());
+                    for w in &u.windows {
+                        println!("  {} {}%", w.label, w.used_percent.round());
+                    }
+                }
+                Err(e) => println!("FAIL: retrieveUserQuota: {e} — PAUSE Feature 4"),
+            }
+        }
+        Ok((None, plan)) => {
+            println!("PARTIAL: no cloudaicompanionProject (plan {plan}) — presence-only; proceed with caution")
+        }
+        Err(e) => println!("FAIL: loadCodeAssist: {e} — PAUSE Feature 4"),
     }
 }
 

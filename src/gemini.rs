@@ -1,0 +1,414 @@
+//! Google Gemini provider, Antigravity surface. The live token lives in the
+//! GNOME keyring (service=gemini, account=antigravity) as a go-keyring blob:
+//! `"go-keyring-base64:" + base64(JSON)` where JSON =
+//! `{"token":{access_token,token_type:"Bearer",refresh_token,expiry(ISO8601)},"auth_method":"consumer"}`.
+//! Usage comes from cloudcode-pa.googleapis.com Code Assist; identity from
+//! Google `userinfo` (the blob carries no email).
+
+use crate::usage_api::{parse_iso8601, ApiError};
+use crate::util::now_ms;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use chrono::{DateTime, Local, SecondsFormat, Utc};
+use serde_json::{json, Value};
+use std::time::Duration;
+
+const GO_KEYRING_PREFIX: &str = "go-keyring-base64:";
+const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const USERINFO_URL: &str = "https://openidconnect.googleapis.com/v1/userinfo";
+const CODE_ASSIST_BASE: &str = "https://cloudcode-pa.googleapis.com/v1internal";
+/// loadCodeAssist platform metadata. Mac sent DARWIN_ARM64; a neutral value is
+/// used on Linux. **[verify]** the field does not gate the response (see spike).
+const PLATFORM: &str = "PLATFORM_UNSPECIFIED";
+
+/// Antigravity's public installed-app OAuth client (reverse-engineered).
+pub const ANTIGRAVITY_CLIENT_ID: &str =
+    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+/// **[verify]** reverse-engineered; the spike confirms it refreshes/exchanges.
+pub const ANTIGRAVITY_CLIENT_SECRET: &str = "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";
+// SCOPES/PROVIDER/SURFACE_TAG are the provider surface consumed by Tasks 2-10.
+#[allow(dead_code)]
+pub const SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform \
+https://www.googleapis.com/auth/userinfo.email \
+https://www.googleapis.com/auth/userinfo.profile \
+https://www.googleapis.com/auth/cclog \
+https://www.googleapis.com/auth/experimentsandconfigs";
+
+#[allow(dead_code)]
+pub const PROVIDER: &str = "gemini";
+/// The one surface on Linux; shown as the row's surface tag.
+#[allow(dead_code)]
+pub const SURFACE_TAG: &str = "Antigravity";
+
+pub struct Creds {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    #[allow(dead_code)] // consumed when persisting refreshed blobs (Task 2)
+    pub id_token: Option<String>,
+    pub expiry_ms: f64, // ms epoch; 0 = unknown
+}
+
+impl Creds {
+    /// Expired (with a 60s safety margin) when we have a known expiry in the past.
+    pub fn is_expired(&self) -> bool {
+        self.expiry_ms > 0.0 && now_ms() >= self.expiry_ms - 60_000.0
+    }
+}
+
+pub struct Refreshed {
+    pub access_token: String,
+    #[allow(dead_code)] // written back to the blob in Task 2
+    pub id_token: Option<String>,
+    #[allow(dead_code)] // written back to the blob in Task 2
+    pub expires_at_ms: f64,
+}
+
+#[derive(Clone)]
+pub struct Usage {
+    pub windows: Vec<UsageWindow>,
+    #[allow(dead_code)] // rendered on the tray row in Task 6
+    pub fetched_at: DateTime<Local>,
+}
+
+#[derive(Clone)]
+pub struct UsageWindow {
+    pub label: String,
+    pub used_percent: f64,
+    #[allow(dead_code)] // rendered as reset time on the tray row in Task 6
+    pub resets_at: Option<DateTime<Utc>>,
+}
+
+#[allow(dead_code)] // aggregates consumed by the tray/menu-bar in Task 6
+impl Usage {
+    pub fn max_utilization(&self) -> f64 {
+        self.windows
+            .iter()
+            .map(|w| w.used_percent)
+            .fold(0.0, f64::max)
+    }
+    /// The highest-utilization window — the row's main bar + menu-bar %.
+    pub fn binding(&self) -> Option<&UsageWindow> {
+        self.windows.iter().max_by(|a, b| {
+            a.used_percent
+                .partial_cmp(&b.used_percent)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    }
+}
+
+/// The Antigravity keyring value is `"go-keyring-base64:" + base64(JSON)`.
+pub fn decode_go_keyring(raw: &str) -> Option<Vec<u8>> {
+    let b64 = raw.trim().strip_prefix(GO_KEYRING_PREFIX)?;
+    STANDARD.decode(b64).ok()
+}
+
+#[allow(dead_code)] // used to write the refreshed blob back to the keyring (Task 2)
+pub fn encode_go_keyring(json: &[u8]) -> String {
+    format!("{GO_KEYRING_PREFIX}{}", STANDARD.encode(json))
+}
+
+/// Parse the opaque Antigravity keyring blob into tokens (no email — that comes
+/// from `userinfo`). Returns `None` for a tokenless blob.
+///
+/// go-keyring wraps secrets it can't store directly as `go-keyring-base64:` +
+/// base64(JSON); but on this machine Antigravity wrote the JSON **unwrapped**
+/// (confirmed live — see the Task 1 spike). Accept both: strip the wrapper when
+/// present, otherwise treat the raw bytes as the JSON.
+pub fn antigravity_creds(blob: &[u8]) -> Option<Creds> {
+    let raw = std::str::from_utf8(blob).ok()?;
+    let json =
+        decode_go_keyring(raw).unwrap_or_else(|| raw.trim().as_bytes().to_vec());
+    let root: Value = serde_json::from_slice(&json).ok()?;
+    let tok = root.get("token")?;
+    let access = tok.get("access_token")?.as_str()?;
+    if access.is_empty() {
+        return None;
+    }
+    let expiry_ms = tok
+        .get("expiry")
+        .and_then(Value::as_str)
+        .and_then(parse_iso8601)
+        .map(|d| d.timestamp_millis() as f64)
+        .unwrap_or(0.0);
+    Some(Creds {
+        access_token: access.to_string(),
+        refresh_token: tok
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .map(String::from),
+        id_token: tok.get("id_token").and_then(Value::as_str).map(String::from),
+        expiry_ms,
+    })
+}
+
+/// "gemini-3.1-pro-preview" -> "3.1-pro" (drop `gemini-` prefix + `-preview`).
+pub fn short_model_name(model_id: &str) -> String {
+    let s = model_id.strip_prefix("gemini-").unwrap_or(model_id);
+    s.strip_suffix("-preview").unwrap_or(s).to_string()
+}
+
+/// Parse a retrieveUserQuota response into per-model windows. Buckets missing
+/// `remainingFraction` are skipped.
+pub fn parse_quota(data: &[u8]) -> Usage {
+    let root: Value = serde_json::from_slice(data).unwrap_or(Value::Null);
+    let mut windows = Vec::new();
+    if let Some(buckets) = root.get("buckets").and_then(Value::as_array) {
+        for b in buckets {
+            let Some(model) = b.get("modelId").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(frac) = b.get("remainingFraction").and_then(Value::as_f64) else {
+                continue;
+            };
+            let used = ((1.0 - frac) * 100.0).clamp(0.0, 100.0);
+            let resets_at = b
+                .get("resetTime")
+                .and_then(Value::as_str)
+                .and_then(parse_iso8601);
+            windows.push(UsageWindow {
+                label: short_model_name(model),
+                used_percent: used,
+                resets_at,
+            });
+        }
+    }
+    Usage {
+        windows,
+        fetched_at: Local::now(),
+    }
+}
+
+/// Parse loadCodeAssist -> (cloudaicompanionProject, short plan label).
+pub fn parse_load_code_assist(data: &[u8]) -> (Option<String>, String) {
+    let root: Value = serde_json::from_slice(data).unwrap_or(Value::Null);
+    let project = root
+        .get("cloudaicompanionProject")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let paid = root
+        .get("paidTier")
+        .and_then(|t| t.get("name"))
+        .and_then(Value::as_str);
+    let current = root
+        .get("currentTier")
+        .and_then(|t| t.get("name"))
+        .and_then(Value::as_str);
+    (project, plan_label(paid, current))
+}
+
+fn plan_label(paid: Option<&str>, current: Option<&str>) -> String {
+    if let Some(p) = paid {
+        if p.contains("Ultra") {
+            return "Ultra".into();
+        }
+        if p.contains("Pro") {
+            return "AI Pro".into();
+        }
+    }
+    if let Some(c) = current {
+        return c.replace("Gemini ", "");
+    }
+    "Code Assist".into()
+}
+
+/// ms-epoch -> RFC3339 string (`…Z`), for writing an Antigravity `expiry` field.
+#[allow(dead_code)] // used to write the refreshed blob back to the keyring (Task 2)
+pub fn expiry_iso(expires_at_ms: f64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(expires_at_ms as i64)
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// Google refresh-token grant fields (form-urlencoded). Google does NOT rotate
+/// the refresh token, so the caller keeps the existing one.
+pub fn refresh_form(refresh_token: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("grant_type", "refresh_token".into()),
+        ("refresh_token", refresh_token.to_string()),
+        ("client_id", ANTIGRAVITY_CLIENT_ID.into()),
+        ("client_secret", ANTIGRAVITY_CLIENT_SECRET.into()),
+    ]
+}
+
+fn retry_after(resp: &reqwest::Response) -> Option<f64> {
+    resp.headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+}
+
+/// Refresh the access token in memory (never rotates the stored refresh token).
+pub async fn refresh(client: &reqwest::Client, refresh_token: &str) -> Result<Refreshed, ApiError> {
+    let resp = client
+        .post(TOKEN_URL)
+        .form(&refresh_form(refresh_token))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| ApiError::Network(e.to_string()))?;
+    let status = resp.status().as_u16();
+    if status == 400 || status == 401 || status == 403 {
+        return Err(ApiError::Unauthorized);
+    }
+    if status != 200 {
+        return Err(ApiError::Http(status));
+    }
+    let root: Value = resp.json().await.map_err(|_| ApiError::Malformed)?;
+    let access = root
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or(ApiError::Malformed)?;
+    let expires_in = root
+        .get("expires_in")
+        .and_then(Value::as_f64)
+        .unwrap_or(3600.0);
+    Ok(Refreshed {
+        access_token: access.to_string(),
+        id_token: root.get("id_token").and_then(Value::as_str).map(String::from),
+        expires_at_ms: now_ms() + expires_in * 1000.0,
+    })
+}
+
+/// Resolve the account email for an access token (the blob carries none).
+pub async fn fetch_email(client: &reqwest::Client, access_token: &str) -> Result<String, ApiError> {
+    let resp = client
+        .get(USERINFO_URL)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| ApiError::Network(e.to_string()))?;
+    let status = resp.status().as_u16();
+    if status == 401 || status == 403 {
+        return Err(ApiError::Unauthorized);
+    }
+    if status != 200 {
+        return Err(ApiError::Http(status));
+    }
+    let root: Value = resp.json().await.map_err(|_| ApiError::Malformed)?;
+    root.get("email")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .ok_or(ApiError::Malformed)
+}
+
+/// loadCodeAssist -> (project, plan chip). 429 -> RateLimited; 401/403 -> Unauthorized.
+pub async fn load_project(
+    client: &reqwest::Client,
+    access_token: &str,
+) -> Result<(Option<String>, String), ApiError> {
+    let body = json!({"metadata":{"ideType":"IDE_UNSPECIFIED","platform":PLATFORM,"pluginType":"GEMINI"}});
+    let data = code_assist(client, access_token, "loadCodeAssist", &body).await?;
+    Ok(parse_load_code_assist(&data))
+}
+
+/// retrieveUserQuota -> per-model windows.
+pub async fn fetch_usage(
+    client: &reqwest::Client,
+    access_token: &str,
+    project: &str,
+) -> Result<Usage, ApiError> {
+    let body = json!({ "project": project });
+    let data = code_assist(client, access_token, "retrieveUserQuota", &body).await?;
+    Ok(parse_quota(&data))
+}
+
+async fn code_assist(
+    client: &reqwest::Client,
+    access_token: &str,
+    method: &str,
+    body: &Value,
+) -> Result<Vec<u8>, ApiError> {
+    let resp = client
+        .post(format!("{CODE_ASSIST_BASE}:{method}"))
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("Content-Type", "application/json")
+        .timeout(Duration::from_secs(15))
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| ApiError::Network(e.to_string()))?;
+    let status = resp.status().as_u16();
+    if status == 401 || status == 403 {
+        return Err(ApiError::Unauthorized);
+    }
+    if status == 429 {
+        return Err(ApiError::RateLimited(retry_after(&resp)));
+    }
+    if status != 200 {
+        return Err(ApiError::Http(status));
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| ApiError::Network(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn go_keyring_round_trip() {
+        let inner = br#"{"token":{"access_token":"ya29.AAA"}}"#;
+        let enc = encode_go_keyring(inner);
+        assert!(enc.starts_with("go-keyring-base64:"));
+        assert_eq!(decode_go_keyring(&enc).unwrap(), inner);
+        assert!(decode_go_keyring("not-a-keyring-value").is_none());
+    }
+
+    #[test]
+    fn antigravity_creds_parses_token() {
+        let inner = br#"{"token":{"access_token":"ya29.AAA","refresh_token":"1//rt","expiry":"2026-07-01T20:00:00Z","token_type":"Bearer"},"auth_method":"consumer"}"#;
+        let blob = encode_go_keyring(inner).into_bytes();
+        let c = antigravity_creds(&blob).unwrap();
+        assert_eq!(c.access_token, "ya29.AAA");
+        assert_eq!(c.refresh_token.as_deref(), Some("1//rt"));
+        assert!(c.expiry_ms > 0.0);
+    }
+
+    #[test]
+    fn antigravity_creds_parses_unwrapped_json() {
+        // On this machine the item is stored WITHOUT the go-keyring-base64 wrapper
+        // (raw JSON) — confirmed by the Task 1 live spike. Must parse that too.
+        let raw = br#"{"token":{"access_token":"ya29.BBB","refresh_token":"1//rt2","expiry":"2026-07-01T20:00:00Z","token_type":"Bearer"},"auth_method":"consumer"}"#;
+        let c = antigravity_creds(raw).unwrap();
+        assert_eq!(c.access_token, "ya29.BBB");
+        assert_eq!(c.refresh_token.as_deref(), Some("1//rt2"));
+        assert!(c.expiry_ms > 0.0);
+    }
+
+    #[test]
+    fn short_model_name_drops_affixes() {
+        assert_eq!(short_model_name("gemini-3.1-pro-preview"), "3.1-pro");
+        assert_eq!(short_model_name("gemini-2.5-flash"), "2.5-flash");
+        assert_eq!(short_model_name("plain"), "plain");
+    }
+
+    #[test]
+    fn parse_quota_maps_buckets_and_skips_partial() {
+        let data = br#"{"buckets":[
+            {"modelId":"gemini-3.1-pro-preview","remainingFraction":0.78,"resetTime":"2026-07-01T20:00:00Z"},
+            {"modelId":"gemini-2.5-flash","remainingFraction":0.95},
+            {"modelId":"gemini-nano"}
+        ]}"#;
+        let u = parse_quota(data);
+        assert_eq!(u.windows.len(), 2); // nano skipped (no remainingFraction)
+        assert_eq!(u.windows[0].label, "3.1-pro");
+        assert!((u.windows[0].used_percent - 22.0).abs() < 0.01);
+        assert!(u.windows[0].resets_at.is_some());
+        assert!((u.max_utilization() - 22.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_load_code_assist_project_and_plan() {
+        let d = br#"{"cloudaicompanionProject":"proj-123","paidTier":{"name":"Google One AI Pro"}}"#;
+        let (p, plan) = parse_load_code_assist(d);
+        assert_eq!(p.as_deref(), Some("proj-123"));
+        assert_eq!(plan, "AI Pro");
+        let d2 = br#"{"currentTier":{"name":"Gemini Code Assist"}}"#;
+        let (proj2, plan2) = parse_load_code_assist(d2);
+        assert!(proj2.is_none());
+        assert_eq!(plan2, "Code Assist");
+    }
+}
