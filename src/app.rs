@@ -40,7 +40,6 @@ pub enum Action {
     SetSetting(SettingChange),
     Login { key: String },
     LoginFinished { key: String, result: Result<(), String> },
-    #[allow(dead_code)] // constructed by Task 7 (tray menu render)
     UpdateAndRelaunch,
     Quit,
 }

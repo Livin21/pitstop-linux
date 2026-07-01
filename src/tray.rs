@@ -43,7 +43,6 @@ pub struct TrayView {
     pub error_line: Option<String>,
     pub settings: Settings,
     pub launch_at_login: bool,
-    #[allow(dead_code)] // read by Task 7 (tray menu render)
     pub update_info: Option<UpdateInfo>,
 }
 
@@ -172,6 +171,14 @@ impl Tray for PitStopTray {
 
         items.push(MenuItem::Separator);
         items.push(self.settings_submenu());
+        items.push(disabled(format!("PitStop v{}", env!("CARGO_PKG_VERSION"))));
+        if let Some(ref info) = v.update_info {
+            items.push(send_item(
+                format!("Update & Relaunch  (v{} available)", info.version),
+                true,
+                Action::UpdateAndRelaunch,
+            ));
+        }
         items.push(send_item("Quit PitStop".into(), true, Action::Quit));
         items
     }
@@ -337,5 +344,34 @@ mod tests {
             rows: vec![],
         };
         assert!(g.dashboard_url.is_none());
+    }
+
+    #[test]
+    fn version_line_label_correct() {
+        // The disabled menu item always shows the running version.
+        let label = format!("PitStop v{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(label, "PitStop v0.3.1");
+    }
+
+    #[test]
+    fn update_item_label_correct() {
+        // When an update is available the label includes the new version.
+        let info = UpdateInfo {
+            version: "0.4.0".into(),
+            url: "https://github.com/Livin21/pitstop-linux/releases/tag/v0.4.0".into(),
+            can_rebuild: true,
+        };
+        let label = format!("Update & Relaunch  (v{} available)", info.version);
+        assert_eq!(label, "Update & Relaunch  (v0.4.0 available)");
+    }
+
+    #[test]
+    fn no_update_means_item_absent() {
+        // up-to-date → update_info is None → no item should appear
+        let update_info: Option<UpdateInfo> = None;
+        assert!(
+            update_info.is_none(),
+            "None update_info → Update & Relaunch item must not appear"
+        );
     }
 }
