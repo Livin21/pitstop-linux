@@ -400,27 +400,62 @@ impl Engine {
 
     fn record_usage_samples(&mut self) {
         let now = Instant::now();
-        let mut samples: Vec<(String, f64)> = Vec::new();
-        for (k, r) in &self.usage {
-            if !self.fetch_error.contains_key(k) {
-                samples.push((k.clone(), r.max_utilization()));
+        // Collect (account_key, window_label, utilisation) for every window we have
+        // fresh data for. We explicitly avoid `self` borrows inside the loop.
+        let mut windows: Vec<(String, String, f64)> = Vec::new();
+        for (key, report) in &self.usage {
+            if self.fetch_error.contains_key(key) {
+                continue;
+            }
+            if let Some(u) = report.five_hour.and_then(|w| w.utilization) {
+                windows.push((key.clone(), "5h".to_string(), u));
+            }
+            if let Some(u) = report.seven_day.and_then(|w| w.utilization) {
+                windows.push((key.clone(), "7d".to_string(), u));
             }
         }
-        for (k, cu) in &self.codex_usage {
-            if !self.fetch_error.contains_key(k) {
-                samples.push((k.clone(), cu.max_utilization()));
+        for (key, cu) in &self.codex_usage {
+            if self.fetch_error.contains_key(key) {
+                continue;
+            }
+            for w in &cu.windows {
+                windows.push((key.clone(), w.label.clone(), w.used_percent));
             }
         }
-        for (key, util) in samples {
-            let entry = self.usage_history.entry(key).or_default();
-            if let Some(last) = entry.last() {
-                if util < last.1 - 1.0 {
-                    entry.clear(); // window reset
-                }
-            }
-            entry.push((now, util));
-            entry.retain(|(t, _)| now.duration_since(*t).as_secs_f64() <= 1800.0);
+        for (account_key, label, util) in windows {
+            let wkey = format!("{account_key}#{label}");
+            record_window_sample(&mut self.usage_history, &wkey, util, now);
         }
+    }
+
+    /// The windows PitStop may project toward their limit for `key`.
+    /// For Claude: the 5-hour and weekly windows (when utilisation is present).
+    /// For Codex: every rate-limit window the API reported.
+    /// Returns `(label, current_util, resets_at)` tuples, matching the
+    /// per-window sample keys `"{key}#{label}"` in `usage_history`.
+    #[allow(dead_code)] // wired up in a later task
+    fn projectable_windows(
+        &self,
+        key: &str,
+    ) -> Vec<(String, f64, Option<DateTime<chrono::Utc>>)> {
+        if let Some(cu) = self.codex_usage.get(key) {
+            return cu
+                .windows
+                .iter()
+                .map(|w| (w.label.clone(), w.used_percent, w.resets_at))
+                .collect();
+        }
+        if let Some(report) = self.usage.get(key) {
+            let mut v: Vec<(String, f64, Option<DateTime<chrono::Utc>>)> = Vec::new();
+            if let Some(u) = report.five_hour.and_then(|w| w.utilization) {
+                v.push(("5h".to_string(), u, report.five_hour.and_then(|w| w.resets_at)));
+            }
+            if let Some(u) = report.seven_day.and_then(|w| w.utilization) {
+                v.push(("7d".to_string(), u, report.seven_day.and_then(|w| w.resets_at)));
+            }
+            return v;
+        }
+        vec![]
     }
 
     fn projected_full(&self, key: &str, current: f64, resets_at: Option<DateTime<chrono::Utc>>) -> Option<DateTime<Local>> {
@@ -937,6 +972,27 @@ impl Engine {
     }
 }
 
+/// Append one (timestamp, utilisation) sample to the per-window history,
+/// pruning entries older than 30 min and clearing all entries when a window
+/// appears to have reset (utilisation dropped by more than 2.0 points).
+/// The `now` parameter is threaded from the caller so all windows in a
+/// single refresh share the same timestamp.
+fn record_window_sample(
+    history: &mut HashMap<String, Vec<(Instant, f64)>>,
+    key: &str,
+    util: f64,
+    now: Instant,
+) {
+    let entry = history.entry(key.to_string()).or_default();
+    if let Some(last) = entry.last() {
+        if util < last.1 - 2.0 {
+            entry.clear(); // window reset
+        }
+    }
+    entry.push((now, util));
+    entry.retain(|(t, _)| now.duration_since(*t).as_secs_f64() <= 1800.0);
+}
+
 /// Least-squares slope (utilisation % per second) over time-stamped samples.
 /// Returns `None` when all samples share the same timestamp (degenerate).
 /// Matches the Swift `slopePerSecond` in AppDelegate.swift (v0.3.1 diff).
@@ -1107,5 +1163,63 @@ mod tests {
         assert_eq!(window_name("14d"), "14d");
         assert_eq!(window_name("1h"),  "1h");
         assert_eq!(window_name(""),    "");
+    }
+
+    use std::collections::HashMap;
+
+    // helper alias to avoid repeating the long type
+    type History = HashMap<String, Vec<(Instant, f64)>>;
+
+    // ── record_window_sample ───────────────────────────────────────────────
+
+    #[test]
+    fn per_window_key_format() {
+        // Verify the key schema consumed everywhere downstream.
+        assert_eq!(format!("{acc}#{lbl}", acc = "me@x.com", lbl = "7d"), "me@x.com#7d");
+        assert_eq!(
+            format!("{acc}#{lbl}", acc = "codex:me@x.com", lbl = "5h"),
+            "codex:me@x.com#5h"
+        );
+    }
+
+    #[test]
+    fn reset_detection_clears_on_drop_over_2() {
+        let mut h: History = HashMap::new();
+        let now = Instant::now();
+        record_window_sample(&mut h, "k#5h", 55.0, now);
+        record_window_sample(&mut h, "k#5h", 50.0, now); // drop 5.0 > 2.0 → clear
+        assert_eq!(h["k#5h"].len(), 1, "should have cleared on > 2.0 drop");
+    }
+
+    #[test]
+    fn reset_detection_keeps_on_drop_of_exactly_2() {
+        let mut h: History = HashMap::new();
+        let now = Instant::now();
+        record_window_sample(&mut h, "k#7d", 60.0, now);
+        // 60.0 - 58.0 = 2.0, which is NOT > 2.0, so no clear
+        record_window_sample(&mut h, "k#7d", 58.0, now);
+        assert_eq!(h["k#7d"].len(), 2, "drop of exactly 2.0 must not reset");
+    }
+
+    #[test]
+    fn reset_detection_keeps_on_rise() {
+        let mut h: History = HashMap::new();
+        let now = Instant::now();
+        for util in [10.0, 20.0, 30.0, 40.0] {
+            record_window_sample(&mut h, "k#5h", util, now);
+        }
+        assert_eq!(h["k#5h"].len(), 4, "rising series should accumulate");
+    }
+
+    #[test]
+    fn samples_older_than_30_min_are_pruned() {
+        let mut h: History = HashMap::new();
+        let old = Instant::now() - Duration::from_secs(1801); // just over 30 min ago
+        let now = Instant::now();
+        // Manually seed an old entry
+        h.entry("k#5h".to_string()).or_default().push((old, 10.0));
+        record_window_sample(&mut h, "k#5h", 20.0, now);
+        // The old entry is 1801 s before `now`; retain condition: now.duration_since(t) <= 1800
+        assert_eq!(h["k#5h"].len(), 1, "old sample should have been pruned");
     }
 }
