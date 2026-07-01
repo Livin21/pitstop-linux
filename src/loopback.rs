@@ -8,7 +8,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-#[derive(Debug)]
 pub struct Callback {
     pub code: String,
     pub state: String,
@@ -139,7 +138,9 @@ mod tests {
     #[tokio::test]
     async fn wait_times_out_with_no_client() {
         let server = Loopback::bind(None).await.unwrap();
-        let err = server.wait(Duration::from_millis(150)).await.unwrap_err();
+        let result = server.wait(Duration::from_millis(150)).await;
+        assert!(result.is_err(), "expected timeout");
+        let err = result.err().unwrap();               // Option::unwrap has no T: Debug bound
         assert!(err.to_string().contains("timed out"));
     }
 
