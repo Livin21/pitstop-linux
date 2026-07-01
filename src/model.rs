@@ -9,6 +9,7 @@ use crate::usage_api::UsageReport;
 pub enum Provider {
     Claude,
     Codex,
+    Gemini,
 }
 
 impl Provider {
@@ -16,28 +17,29 @@ impl Provider {
         match self {
             Provider::Claude => "Claude",
             Provider::Codex => "Codex",
+            Provider::Gemini => "Gemini",
         }
     }
 
     /// Web usage dashboard for this provider.
-    /// NOTE: The `Provider::Gemini` arm (`Some("https://gemini.google.com/usage")`)
-    /// is intentionally absent here — it will be added by Plan 4 when the Gemini
-    /// variant is introduced. Add it as:
-    ///   Provider::Gemini => Some("https://gemini.google.com/usage"),
     pub fn dashboard_url(&self) -> Option<&'static str> {
-        match self {
-            Provider::Claude => Some("https://claude.ai/new#settings/usage"),
-            Provider::Codex => Some("https://chatgpt.com/codex/cloud/settings/analytics#usage"),
-        }
+        Some(match self {
+            Provider::Claude => "https://claude.ai/new#settings/usage",
+            Provider::Codex => "https://chatgpt.com/codex/cloud/settings/analytics#usage",
+            Provider::Gemini => "https://gemini.google.com/usage",
+        })
     }
 
-    pub const ALL: [Provider; 2] = [Provider::Claude, Provider::Codex];
+    pub const ALL: [Provider; 3] = [Provider::Claude, Provider::Codex, Provider::Gemini];
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     Code,
     Codex,
+    // Scaffolded for Plan 4 Gemini integration; wired up in later tasks.
+    #[allow(dead_code)]
+    Gemini,
 }
 
 /// One row in the menu. Across providers, accounts don't merge: a Claude and a
@@ -55,20 +57,25 @@ impl MenuAccount {
     pub fn is_codex(&self) -> bool {
         self.source == Source::Codex
     }
+    // Scaffolded for Plan 4 Gemini integration; called in later tasks.
+    #[allow(dead_code)]
+    pub fn is_gemini(&self) -> bool {
+        self.source == Source::Gemini
+    }
     pub fn provider(&self) -> Provider {
-        if self.is_codex() {
-            Provider::Codex
-        } else {
-            Provider::Claude
+        match self.source {
+            Source::Codex => Provider::Codex,
+            Source::Gemini => Provider::Gemini,
+            Source::Code => Provider::Claude,
         }
     }
     /// Storage key for usage/error/backoff maps — namespaced by provider so a
     /// Claude and a Codex account with the same email don't collide.
     pub fn key(&self) -> String {
-        if self.is_codex() {
-            format!("codex:{}", self.email)
-        } else {
-            self.email.clone()
+        match self.source {
+            Source::Codex => format!("codex:{}", self.email),
+            Source::Gemini => format!("gemini:{}", self.email),
+            Source::Code => self.email.clone(),
         }
     }
 }
@@ -210,5 +217,22 @@ mod tests {
                 p.title()
             );
         }
+    }
+
+    #[test]
+    fn gemini_provider_and_account_key() {
+        assert_eq!(Provider::Gemini.title(), "Gemini");
+        assert_eq!(Provider::ALL.len(), 3);
+        assert_eq!(Provider::Gemini.dashboard_url(), Some("https://gemini.google.com/usage"));
+        let a = MenuAccount {
+            email: "me@x".into(),
+            source: Source::Gemini,
+            plan_label: "AI Pro".into(),
+            is_active: false,
+        };
+        assert!(a.is_gemini());
+        assert!(!a.is_codex());
+        assert_eq!(a.key(), "gemini:me@x");
+        assert_eq!(a.provider().title(), "Gemini");
     }
 }

@@ -660,6 +660,8 @@ impl Engine {
         let adapter: Box<dyn LoginAdapter> = match provider {
             Provider::Codex => Box::new(oauth::CodexLoginAdapter),
             Provider::Claude => Box::new(oauth::ClaudeLoginAdapter),
+            // Gemini login adapter not yet implemented; will be added in a later task.
+            Provider::Gemini => todo!("Gemini login adapter"),
         };
         let http = self.client.clone();
         let tx = self.action_tx.clone();
