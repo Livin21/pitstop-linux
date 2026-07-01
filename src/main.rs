@@ -125,6 +125,61 @@ async fn check() {
             }
         }
     }
+
+    // Gemini / Antigravity section
+    match gemini_store::GeminiStore::live_blob().await {
+        Err(e) => {
+            println!("\nGemini: no keyring / Secret Service unavailable ({e})");
+        }
+        Ok(None) => {
+            let gstore = gemini_store::GeminiStore::new();
+            if gstore.profiles.is_empty() {
+                println!("\nGemini: not signed in");
+            } else {
+                for profile in &gstore.profiles {
+                    println!(
+                        "\n▢ {}  [{}]  · Antigravity",
+                        profile.email, profile.plan_label
+                    );
+                    match gstore.saved_blob(&profile.email) {
+                        Ok(Some(blob)) => match check_gemini(&client, &blob).await {
+                            Ok((_email, _plan, usage)) => print_gemini_usage(&usage),
+                            Err(e) => println!("   error: {e}"),
+                        },
+                        Ok(None) => println!("   (no saved credentials)"),
+                        Err(e) => println!("   error: {e}"),
+                    }
+                }
+            }
+        }
+        Ok(Some(raw)) => {
+            match check_gemini(&client, &raw).await {
+                Ok((live_email, plan, usage)) => {
+                    println!("\n▣ {}  [{}]  · Antigravity", live_email, plan);
+                    print_gemini_usage(&usage);
+                    let gstore = gemini_store::GeminiStore::new();
+                    for profile in gstore.profiles.iter().filter(|p| p.email != live_email) {
+                        println!(
+                            "\n▢ {}  [{}]  · Antigravity",
+                            profile.email, profile.plan_label
+                        );
+                        match gstore.saved_blob(&profile.email) {
+                            Ok(Some(blob)) => match check_gemini(&client, &blob).await {
+                                Ok((_email, _plan, usage)) => print_gemini_usage(&usage),
+                                Err(e) => println!("   error: {e}"),
+                            },
+                            Ok(None) => println!("   (no saved credentials)"),
+                            Err(e) => println!("   error: {e}"),
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("\nGemini  · Antigravity");
+                    println!("   error: {e}");
+                }
+            }
+        }
+    }
 }
 
 /// `pitstop --gemini-spike` — GATE for Feature 4. Prove we can read the
@@ -279,5 +334,56 @@ async fn check_codex(
                 .map_err(|e| e.to_string())
         }
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Decode the Antigravity blob, refresh the access token in memory if expired,
+/// then resolve email + plan + usage via the Code Assist APIs. Read-only; never
+/// persists to the keyring or snapshot files, never prints token values.
+async fn check_gemini(
+    client: &reqwest::Client,
+    blob: &[u8],
+) -> Result<(String, String, gemini::Usage), String> {
+    let creds = gemini::antigravity_creds(blob)
+        .ok_or_else(|| "could not decode Antigravity blob".to_string())?;
+    let access = if creds.is_expired() {
+        let rt = creds
+            .refresh_token
+            .as_deref()
+            .ok_or_else(|| "token expired and no refresh_token".to_string())?;
+        println!("   token expired — refreshing…");
+        gemini::refresh(client, rt)
+            .await
+            .map_err(|e| e.to_string())?
+            .access_token
+    } else {
+        creds.access_token.clone()
+    };
+    let email = gemini::fetch_email(client, &access)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (project_opt, plan) = gemini::load_project(client, &access)
+        .await
+        .map_err(|e| e.to_string())?;
+    let project = project_opt
+        .ok_or_else(|| "no Code Assist project (free-tier presence only)".to_string())?;
+    let usage = gemini::fetch_usage(client, &access, &project)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((email, plan, usage))
+}
+
+fn print_gemini_usage(usage: &gemini::Usage) {
+    if usage.windows.is_empty() {
+        println!("   (no usage windows reported)");
+        return;
+    }
+    for w in &usage.windows {
+        let label = if w.label.is_empty() { "window" } else { &w.label };
+        println!(
+            "   {label}  {}  {}",
+            format::percent(Some(w.used_percent)),
+            format::reset(w.resets_at)
+        );
     }
 }
