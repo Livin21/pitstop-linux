@@ -18,6 +18,7 @@ mod settings;
 mod tray;
 mod usage_api;
 mod util;
+mod updater;
 
 use anyhow::Result;
 
