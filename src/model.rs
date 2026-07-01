@@ -24,7 +24,6 @@ impl Provider {
     /// is intentionally absent here — it will be added by Plan 4 when the Gemini
     /// variant is introduced. Add it as:
     ///   Provider::Gemini => Some("https://gemini.google.com/usage"),
-    #[allow(dead_code)] // used by Task 3 (menu link); remove when wired up
     pub fn dashboard_url(&self) -> Option<&'static str> {
         match self {
             Provider::Claude => Some("https://claude.ai/new#settings/usage"),

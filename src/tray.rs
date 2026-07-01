@@ -18,6 +18,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 pub struct GroupView {
     pub title: String,
+    pub dashboard_url: Option<String>,
     pub rows: Vec<RowView>,
 }
 
@@ -111,6 +112,13 @@ impl Tray for PitStopTray {
         }
         for g in &v.groups {
             items.push(disabled(format!("——  {}  ——", g.title)));
+            if let Some(url) = &g.dashboard_url {
+                items.push(send_item(
+                    format!("↗ Open {} usage dashboard", g.title),
+                    true,
+                    Action::OpenUrl(url.clone()),
+                ));
+            }
             for row in &g.rows {
                 let plan = if row.plan_label.is_empty() {
                     String::new()
@@ -281,4 +289,32 @@ fn submenu(label: &str, items: Vec<MenuItem<PitStopTray>>) -> MenuItem<PitStopTr
         ..Default::default()
     }
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_view_carries_dashboard_url() {
+        let g = GroupView {
+            title: "Claude".to_string(),
+            dashboard_url: Some("https://claude.ai/new#settings/usage".to_string()),
+            rows: vec![],
+        };
+        assert_eq!(
+            g.dashboard_url.as_deref(),
+            Some("https://claude.ai/new#settings/usage"),
+        );
+    }
+
+    #[test]
+    fn group_view_dashboard_url_can_be_none() {
+        let g = GroupView {
+            title: "Unknown".to_string(),
+            dashboard_url: None,
+            rows: vec![],
+        };
+        assert!(g.dashboard_url.is_none());
+    }
 }

@@ -32,7 +32,6 @@ pub enum Action {
     Switch { key: String },
     Save,
     Remove { key: String },
-    #[allow(dead_code)] // constructed in Task 3 (menu items)
     OpenUrl(String),
     SetSetting(SettingChange),
     Quit,
@@ -750,6 +749,7 @@ impl Engine {
             let rows = accounts.iter().map(|a| self.build_row(a)).collect();
             groups.push(GroupView {
                 title: provider.title().into(),
+                dashboard_url: provider.dashboard_url().map(str::to_string),
                 rows,
             });
         }
