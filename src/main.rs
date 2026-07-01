@@ -8,6 +8,8 @@ mod icon;
 mod model;
 mod notify;
 #[allow(dead_code)] // wired into the engine in the login task
+mod loopback;
+#[allow(dead_code)] // wired into the engine in the login task
 mod oauth;
 mod secret_store;
 mod settings;
