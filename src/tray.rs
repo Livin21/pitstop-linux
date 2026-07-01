@@ -128,10 +128,11 @@ impl Tray for PitStopTray {
                 };
                 let header = format!("{}  {}{}", row.marker, row.email, plan);
                 if row.switchable {
-                    let (suffix, action) = if row.login {
-                        ("⟳ Log in again", Action::Login { key: row.switch_key.clone() })
+                    let suffix = row_trailing(row.login);
+                    let action = if row.login {
+                        Action::Login { key: row.switch_key.clone() }
                     } else {
-                        ("⮂ switch", Action::Switch { key: row.switch_key.clone() })
+                        Action::Switch { key: row.switch_key.clone() }
                     };
                     items.push(send_item(format!("{header}    {suffix}"), true, action));
                 } else {
@@ -291,9 +292,25 @@ fn submenu(label: &str, items: Vec<MenuItem<PitStopTray>>) -> MenuItem<PitStopTr
     .into()
 }
 
+/// The trailing action label for a switchable row: Login when the token was
+/// rejected, otherwise the plain account switch.
+fn row_trailing(login: bool) -> &'static str {
+    if login {
+        "⟳ Log in again"
+    } else {
+        "⮂ switch"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_trailing_switches_on_login_flag() {
+        assert_eq!(row_trailing(false), "⮂ switch");
+        assert_eq!(row_trailing(true), "⟳ Log in again");
+    }
 
     #[test]
     fn group_view_carries_dashboard_url() {
