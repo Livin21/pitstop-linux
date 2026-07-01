@@ -18,6 +18,20 @@ impl Provider {
             Provider::Codex => "Codex",
         }
     }
+
+    /// Web usage dashboard for this provider.
+    /// NOTE: The `Provider::Gemini` arm (`Some("https://gemini.google.com/usage")`)
+    /// is intentionally absent here — it will be added by Plan 4 when the Gemini
+    /// variant is introduced. Add it as:
+    ///   Provider::Gemini => Some("https://gemini.google.com/usage"),
+    #[allow(dead_code)] // used by Task 3 (menu link); remove when wired up
+    pub fn dashboard_url(&self) -> Option<&'static str> {
+        match self {
+            Provider::Claude => Some("https://claude.ai/new#settings/usage"),
+            Provider::Codex => Some("https://chatgpt.com/codex/cloud/settings/analytics#usage"),
+        }
+    }
+
     pub const ALL: [Provider; 2] = [Provider::Claude, Provider::Codex];
 }
 
@@ -164,6 +178,38 @@ impl MenuBarSource {
         match self {
             MenuBarSource::ActiveClaudeCode => "Active Claude Code account",
             MenuBarSource::MostUrgent => "Most-used account (any provider)",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dashboard_url_claude() {
+        assert_eq!(
+            Provider::Claude.dashboard_url(),
+            Some("https://claude.ai/new#settings/usage"),
+        );
+    }
+
+    #[test]
+    fn dashboard_url_codex() {
+        assert_eq!(
+            Provider::Codex.dashboard_url(),
+            Some("https://chatgpt.com/codex/cloud/settings/analytics#usage"),
+        );
+    }
+
+    #[test]
+    fn all_current_providers_have_dashboard_url() {
+        for p in Provider::ALL {
+            assert!(
+                p.dashboard_url().is_some(),
+                "{} is missing dashboard_url",
+                p.title()
+            );
         }
     }
 }
