@@ -69,7 +69,7 @@ cargo build --release
 ## Usage
 
 - The **tray icon** shows the active Claude Code account's binding usage
-  (`max(5-hour, weekly)`), color-coded (🟢 < 75 %, 🟠 ≥ 75 %, 🔴 ≥ 90 %), dimmed
+  (`max(5-hour, weekly, per-model)`), color-coded (🟢 < 75 %, 🟠 ≥ 75 %, 🔴 ≥ 90 %), dimmed
   when showing stale data. Hover for a tooltip with the exact numbers.
 - **Click** the icon for the menu: one section per provider, the live account
   first (●), then the rest by headroom. Each account shows a bar per window
@@ -79,6 +79,11 @@ cargo build --release
   **Settings** submenu (what the icon shows, which account/limit it tracks,
   auto-switch + threshold, time-to-limit projection, launch at login).
 - `pitstop --check` prints accounts and live usage to stdout — no GUI.
+- **Self-update:** when a newer GitHub release is detected, a version line and
+  an "Update & Relaunch (vX available)" item appear in the menu. Choosing it
+  runs `git pull` + `cargo build` in the recorded source checkout and
+  exec-relaunches the new binary; if no checkout is found it opens the releases
+  page instead.
 
 ## Adding a second account
 

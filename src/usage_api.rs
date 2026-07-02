@@ -133,6 +133,26 @@ fn retry_after(resp: &reqwest::Response) -> Option<f64> {
         .and_then(|s| s.trim().parse::<f64>().ok())
 }
 
+/// Collapse `weekly_scoped` entries that share the same label, keeping the one
+/// with the higher utilization. Mirrors the `dedupe_windows` precedent in
+/// `gemini.rs`. Order is preserved by first appearance of each label.
+fn dedupe_scoped(windows: Vec<ScopedWindow>) -> Vec<ScopedWindow> {
+    let mut out: Vec<ScopedWindow> = Vec::new();
+    for w in windows {
+        match out.iter_mut().find(|e| e.label == w.label) {
+            Some(existing)
+                if w.window.utilization.unwrap_or(0.0)
+                    > existing.window.utilization.unwrap_or(0.0) =>
+            {
+                *existing = w;
+            }
+            Some(_) => {} // keep the already-recorded higher-utilization entry
+            None => out.push(w),
+        }
+    }
+    out
+}
+
 /// Parse a usage payload. The OAuth endpoint and claude.ai's web endpoint
 /// return the same shape, so both fetch paths share this.
 pub fn parse(data: &[u8]) -> Result<UsageReport, ApiError> {
@@ -161,7 +181,7 @@ pub fn parse(data: &[u8]) -> Result<UsageReport, ApiError> {
     if seven_day.is_none() {
         seven_day = limit_window_by_kind(limits, "weekly_all");
     }
-    let scoped: Vec<ScopedWindow> = limits
+    let raw_scoped: Vec<ScopedWindow> = limits
         .iter()
         .filter(|e| e.get("kind").and_then(Value::as_str) == Some("weekly_scoped"))
         .filter_map(|e| {
@@ -176,6 +196,7 @@ pub fn parse(data: &[u8]) -> Result<UsageReport, ApiError> {
             Some(ScopedWindow { label, window })
         })
         .collect();
+    let scoped = dedupe_scoped(raw_scoped);
     Ok(UsageReport {
         five_hour,
         seven_day,
@@ -325,6 +346,24 @@ mod tests {
         let report = parse(data).expect("valid payload");
         assert!(report.scoped.is_empty());
         assert_eq!(report.max_utilization(), 1.0);
+    }
+
+    #[test]
+    fn scoped_label_dedup_keeps_higher_utilization() {
+        // Two weekly_scoped entries both missing display_name → both "Scoped".
+        // The dedup must keep the one with the higher percent (70 > 30).
+        let data = br#"{"limits": [
+            {"kind": "weekly_scoped", "percent": 30},
+            {"kind": "weekly_scoped", "percent": 70}
+        ]}"#;
+        let report = parse(data).expect("valid payload");
+        assert_eq!(report.scoped.len(), 1, "two 'Scoped' entries should collapse to one");
+        assert_eq!(report.scoped[0].label, "Scoped");
+        assert_eq!(
+            report.scoped[0].window.utilization,
+            Some(70.0),
+            "dedup must keep the higher utilization"
+        );
     }
 
     #[test]

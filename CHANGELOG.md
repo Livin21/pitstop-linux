@@ -15,23 +15,11 @@ All notable changes to PitStop (Linux) will be documented here.
 - **Single-instance lock:** a second PitStop (e.g. a dev binary beside an
   installed copy) exits at launch instead of fighting over the live credential
   files.
-
-### Added
-
-- **Gemini provider (Antigravity surface).** Live Code Assist usage, account
-  switching, auto-switch participation, and an in-app Login safety net. The
-  Antigravity OAuth token is read from and written back to the GNOME keyring
-  (`service=gemini, account=antigravity`). Note: Antigravity's terms discourage
-  rotating this token — switching is surfaced with that caveat and auto-switch
-  stays opt-in.
-- `pitstop --gemini-spike` diagnostic: reads the keyring token and probes the
-  Code Assist endpoint, printing results to stdout (no GUI required).
-- **Secret Service / D-Bus keyring layer** (`secret_service.rs`): go-keyring
-  compatible read/write over the D-Bus Secret Service protocol, used by the
-  Gemini provider.
-- **In-app Login flow** for expired accounts (Claude Code, Codex, Gemini):
-  a Login button appears on expired rows and triggers the provider's PKCE
-  re-authentication flow without leaving PitStop.
+- **Self-update:** at startup and once per day, PitStop checks GitHub for a
+  newer release. When one is found the menu shows the new version and an
+  "Update & Relaunch" item; if the app was installed via `install.sh` it runs
+  `git pull` + `cargo build` and exec-relaunches; otherwise it opens the
+  releases page.
 
 ### Fixed
 
@@ -58,6 +46,25 @@ All notable changes to PitStop (Linux) will be documented here.
   "Last seen …" stamp instead of a sentence about PitStop's token mechanics.
 - The auto-switch setting copy now discloses it covers Gemini as well as
   Claude Code and Codex.
+
+## [0.4.0] — 2026-07-02
+
+### Added
+
+- **Gemini provider (Antigravity surface).** Live Code Assist usage, account
+  switching, auto-switch participation, and an in-app Login safety net. The
+  Antigravity OAuth token is read from and written back to the GNOME keyring
+  (`service=gemini, account=antigravity`). Note: Antigravity's terms discourage
+  rotating this token — switching is surfaced with that caveat and auto-switch
+  stays opt-in.
+- `pitstop --gemini-spike` diagnostic: reads the keyring token and probes the
+  Code Assist endpoint, printing results to stdout (no GUI required).
+- **Secret Service / D-Bus keyring layer** (`secret_service.rs`): go-keyring
+  compatible read/write over the D-Bus Secret Service protocol, used by the
+  Gemini provider.
+- **In-app Login flow** for expired accounts (Claude Code, Codex, Gemini):
+  a Login button appears on expired rows and triggers the provider's PKCE
+  re-authentication flow without leaving PitStop.
 
 ## [0.3.0] — initial Linux port
 

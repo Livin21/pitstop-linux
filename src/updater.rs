@@ -5,9 +5,7 @@ use anyhow::Result;
 use serde_json::Value;
 use std::time::Duration;
 
-#[allow(dead_code)]
 const REPO_SLUG: &str = "Livin21/pitstop-linux";
-#[allow(dead_code)]
 const CHECK_INTERVAL_SECS: u64 = 86_400; // 24 hours
 
 // ---------- data types ----------
@@ -29,7 +27,6 @@ pub struct UpdateInfo {
 /// Parse a version string into (major, minor, patch).
 /// Strips a leading 'v'/'V', drops any pre-release suffix after the first '-',
 /// and treats missing minor/patch as 0. Returns None for non-numeric input.
-#[allow(dead_code)]
 pub fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
     let s = s.trim_start_matches(['v', 'V']);
     let core = s.split('-').next().unwrap_or(s);
@@ -41,7 +38,6 @@ pub fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// True when `remote` is strictly greater than `local`.
-#[allow(dead_code)]
 pub fn is_newer(remote: &str, local: &str) -> bool {
     match (parse_semver(remote), parse_semver(local)) {
         (Some(r), Some(l)) => r > l,
@@ -73,7 +69,6 @@ fn touch_last_check() {
 /// - `None`              — not yet due (throttled); caller keeps existing update_info unchanged
 /// - `Some(None)`        — checked; running version is current; caller clears update_info
 /// - `Some(Some(info))` — update available; caller stores info
-#[allow(dead_code)]
 pub async fn check_if_due(http: &reqwest::Client) -> Option<Option<UpdateInfo>> {
     let now = crate::util::now_secs() as u64;
     if let Some(last) = last_check_secs() {
@@ -122,7 +117,6 @@ fn parse_release(root: &Value, local: &str) -> Option<UpdateInfo> {
 /// Fetch the latest non-prerelease GitHub release and compare to the running
 /// build version. Returns None when up to date, on 404 (no releases), or on
 /// any transient network or parse failure (silent, best-effort).
-#[allow(dead_code)]
 pub async fn check(http: &reqwest::Client) -> Option<UpdateInfo> {
     let local = env!("CARGO_PKG_VERSION");
     let api_url = format!("https://api.github.com/repos/{REPO_SLUG}/releases/latest");
@@ -206,7 +200,6 @@ async fn run_cmd(program: &str, args: &[&str], cwd: Option<&str>) -> Result<()> 
 /// `~/.local/bin/pitstop`, then exec the new binary in place of the current
 /// process (no orphan tray). On any failure returns an Err — the caller must
 /// notify the user and open the release page; no partial install occurs.
-#[allow(dead_code)]
 pub async fn rebuild_and_relaunch(info: &UpdateInfo) -> Result<()> {
     // `info` is part of the interface (the caller uses info.url to open the
     // release page when this returns Err); it is not needed inside the rebuild.
