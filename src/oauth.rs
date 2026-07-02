@@ -590,18 +590,30 @@ impl LoginAdapter for GeminiLoginAdapter {
     }
 
     async fn persist(&self, email: &str, t: &FreshTokens) -> Result<()> {
-        // Profile snapshot ONLY (never the live keyring). Build a fresh blob:
-        // unlike Claude/Codex there is nothing to patch — a re-login produces a
-        // complete fresh token set. `build_antigravity_blob` always emits the
-        // go-keyring-wrapped form; Task 5's `switch_to` form-matches it to the
-        // live keyring at switch time.
+        // Patch the saved snapshot when one exists — Google omits refresh_token
+        // on re-consent, and rebuilding from scratch would destroy the stored
+        // one (and the wrapper form). Build fresh only when there's no snapshot.
+        // Profile snapshot ONLY — never the live keyring.
         let iso = crate::gemini::expiry_iso(t.expires_at_ms as f64);
-        let blob = crate::gemini::build_antigravity_blob(
-            &t.access_token,
-            t.refresh_token.as_deref(),
-            t.id_token.as_deref(),
-            &iso,
-        );
+        let build = || {
+            crate::gemini::build_antigravity_blob(
+                &t.access_token,
+                t.refresh_token.as_deref(),
+                t.id_token.as_deref(),
+                &iso,
+            )
+        };
+        let blob = match secret_store::read(crate::gemini_store::PROVIDER, email)? {
+            Some(old) => crate::gemini::patch_antigravity_blob(
+                &old,
+                &t.access_token,
+                t.refresh_token.as_deref(),
+                t.id_token.as_deref(),
+                &iso,
+            )
+            .unwrap_or_else(build),
+            None => build(),
+        };
         secret_store::write(crate::gemini_store::PROVIDER, email, &blob)
     }
 }
@@ -832,6 +844,35 @@ mod tests {
         assert_eq!(creds.access_token, "ya29.NEW");
         assert_eq!(creds.refresh_token.as_deref(), Some("1//newR"));
         assert_eq!(creds.id_token.as_deref(), Some("idt.NEW"));
+        crate::secret_store::delete(crate::gemini_store::PROVIDER, email).unwrap();
+    }
+
+    #[tokio::test]
+    async fn gemini_persist_patches_existing_snapshot_preserving_refresh() {
+        // Same shared fixed dir as the other oauth persist tests (all set the
+        // SAME XDG value, so parallel interleaving is harmless; unique email).
+        let dir = std::env::temp_dir().join("pitstop-oauth-relogin-tests");
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let email = "persist-gemini-patch@example.com";
+        // Seed a saved snapshot carrying a refresh token.
+        let old = crate::gemini::build_antigravity_blob(
+            "ya29.OLD", Some("1//OLD-RT"), None, "2026-07-01T20:00:00.000Z",
+        );
+        crate::secret_store::write(crate::gemini_store::PROVIDER, email, &old).unwrap();
+        // Re-login returns NO refresh_token (Google omitted it on re-consent).
+        let tokens = FreshTokens {
+            access_token: "ya29.NEW".into(),
+            refresh_token: None,
+            id_token: None,
+            expires_at_ms: 4_102_444_800_000,
+        };
+        GeminiLoginAdapter.persist(email, &tokens).await.unwrap();
+        let saved = crate::secret_store::read(crate::gemini_store::PROVIDER, email)
+            .unwrap()
+            .unwrap();
+        let creds = crate::gemini::antigravity_creds(&saved).unwrap();
+        assert_eq!(creds.access_token, "ya29.NEW"); // updated
+        assert_eq!(creds.refresh_token.as_deref(), Some("1//OLD-RT")); // preserved
         crate::secret_store::delete(crate::gemini_store::PROVIDER, email).unwrap();
     }
 

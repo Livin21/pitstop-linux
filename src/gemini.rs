@@ -246,6 +246,7 @@ pub fn build_antigravity_blob(
 pub fn patch_antigravity_blob(
     old: &[u8],
     access: &str,
+    refresh: Option<&str>,
     id_token: Option<&str>,
     expiry_iso: &str,
 ) -> Option<Vec<u8>> {
@@ -261,6 +262,9 @@ pub fn patch_antigravity_blob(
         let tok = root.get_mut("token")?.as_object_mut()?;
         tok.insert("access_token".into(), json!(access));
         tok.insert("expiry".into(), json!(expiry_iso));
+        if let Some(r) = refresh {
+            tok.insert("refresh_token".into(), json!(r));
+        }
         if let Some(i) = id_token {
             tok.insert("id_token".into(), json!(i));
         }
@@ -549,7 +553,7 @@ mod tests {
         assert_eq!(c.access_token, "acc");
         assert_eq!(c.refresh_token.as_deref(), Some("rt"));
 
-        let patched = patch_antigravity_blob(&built, "newacc", Some("idt"), "2026-08-01T00:00:00.000Z").unwrap();
+        let patched = patch_antigravity_blob(&built, "newacc", None, Some("idt"), "2026-08-01T00:00:00.000Z").unwrap();
         let ps = String::from_utf8(patched.clone()).unwrap();
         assert!(ps.starts_with("go-keyring-base64:"));
         let pc = antigravity_creds(&patched).unwrap();
@@ -563,13 +567,26 @@ mod tests {
         // On this machine the real blob is stored as raw JSON (no go-keyring-base64: prefix).
         // patch must return raw JSON, NOT wrap it.
         let raw = br#"{"token":{"access_token":"old_acc","refresh_token":"1//rt","expiry":"2026-07-01T20:00:00Z","token_type":"Bearer"},"auth_method":"consumer"}"#;
-        let patched = patch_antigravity_blob(raw, "new_acc", Some("idt"), "2026-08-01T00:00:00.000Z").unwrap();
+        let patched = patch_antigravity_blob(raw, "new_acc", None, Some("idt"), "2026-08-01T00:00:00.000Z").unwrap();
         let s = String::from_utf8(patched.clone()).unwrap();
         assert!(!s.starts_with("go-keyring-base64:"), "raw JSON input must NOT be wrapped");
         let pc = antigravity_creds(&patched).unwrap();
         assert_eq!(pc.access_token, "new_acc");
         assert_eq!(pc.refresh_token.as_deref(), Some("1//rt")); // preserved
         assert_eq!(pc.id_token.as_deref(), Some("idt"));
+    }
+
+    #[test]
+    fn patch_antigravity_blob_updates_or_preserves_refresh_token() {
+        let built = build_antigravity_blob("acc", Some("OLD-RT"), None, "2026-07-01T20:00:00.000Z");
+        // Some(refresh) updates it.
+        let updated =
+            patch_antigravity_blob(&built, "acc2", Some("NEW-RT"), None, "2026-08-01T00:00:00.000Z").unwrap();
+        assert_eq!(antigravity_creds(&updated).unwrap().refresh_token.as_deref(), Some("NEW-RT"));
+        // None preserves the stored one (Google omits refresh_token on re-consent).
+        let preserved =
+            patch_antigravity_blob(&built, "acc3", None, None, "2026-08-01T00:00:00.000Z").unwrap();
+        assert_eq!(antigravity_creds(&preserved).unwrap().refresh_token.as_deref(), Some("OLD-RT"));
     }
 
     #[test]

@@ -573,6 +573,7 @@ impl Engine {
                 if let Some(patched) = gemini::patch_antigravity_blob(
                     &blob,
                     &refreshed.access_token,
+                    None,
                     refreshed.id_token.as_deref(),
                     &gemini::expiry_iso(refreshed.expires_at_ms),
                 ) {
