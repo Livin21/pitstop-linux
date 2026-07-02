@@ -1106,16 +1106,6 @@ impl Engine {
             detail.push(window_line("7d", f7, report.seven_day.and_then(|w| w.resets_at)));
 
             let mut extras: Vec<String> = Vec::new();
-            if let Some(v) = report.seven_day_opus.and_then(|w| w.utilization) {
-                if v > 0.0 {
-                    extras.push(format!("Opus wk {}", format::percent(Some(v))));
-                }
-            }
-            if let Some(v) = report.seven_day_sonnet.and_then(|w| w.utilization) {
-                if v > 0.0 {
-                    extras.push(format!("Sonnet wk {}", format::percent(Some(v))));
-                }
-            }
             if report.extra_usage_enabled {
                 extras.push(format!("Extra {}", format::percent(report.extra_usage_utilization)));
             }

@@ -41,12 +41,22 @@ pub struct UsageWindow {
     pub resets_at: Option<DateTime<Utc>>,
 }
 
+/// A per-model weekly limit ("Fable", …) from the `limits[]` array's
+/// `weekly_scoped` entries. An independent cap: hitting it blocks only that
+/// model, but per user preference it still counts toward the binding number.
+#[derive(Clone)]
+#[allow(dead_code)] // consumed by later tasks (tray display)
+pub struct ScopedWindow {
+    pub label: String,
+    pub window: UsageWindow,
+}
+
 #[derive(Clone)]
 pub struct UsageReport {
     pub five_hour: Option<UsageWindow>,
     pub seven_day: Option<UsageWindow>,
-    pub seven_day_opus: Option<UsageWindow>,
-    pub seven_day_sonnet: Option<UsageWindow>,
+    #[allow(dead_code)] // consumed by later tasks (tray display)
+    pub scoped: Vec<ScopedWindow>,
     pub extra_usage_enabled: bool,
     pub extra_usage_utilization: Option<f64>,
     pub fetched_at: DateTime<Local>,
@@ -128,11 +138,40 @@ pub fn parse(data: &[u8]) -> Result<UsageReport, ApiError> {
         extra_enabled = extra.get("is_enabled").and_then(Value::as_bool).unwrap_or(false);
         extra_util = extra.get("utilization").and_then(Value::as_f64);
     }
+    let empty: Vec<Value> = Vec::new();
+    let limits = root
+        .get("limits")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    // 5h/7d keep coming from the legacy top-level fields (more precision);
+    // fall back to the limits[] session / weekly_all entries when absent.
+    let mut five_hour = window(root.get("five_hour"));
+    if five_hour.is_none() {
+        five_hour = limit_window_by_kind(limits, "session");
+    }
+    let mut seven_day = window(root.get("seven_day"));
+    if seven_day.is_none() {
+        seven_day = limit_window_by_kind(limits, "weekly_all");
+    }
+    let scoped: Vec<ScopedWindow> = limits
+        .iter()
+        .filter(|e| e.get("kind").and_then(Value::as_str) == Some("weekly_scoped"))
+        .filter_map(|e| {
+            let window = limit_window_entry(e)?;
+            let label = e
+                .get("scope")
+                .and_then(|s| s.get("model"))
+                .and_then(|m| m.get("display_name"))
+                .and_then(Value::as_str)
+                .unwrap_or("Scoped")
+                .to_string();
+            Some(ScopedWindow { label, window })
+        })
+        .collect();
     Ok(UsageReport {
-        five_hour: window(root.get("five_hour")),
-        seven_day: window(root.get("seven_day")),
-        seven_day_opus: window(root.get("seven_day_opus")),
-        seven_day_sonnet: window(root.get("seven_day_sonnet")),
+        five_hour,
+        seven_day,
+        scoped,
         extra_usage_enabled: extra_enabled,
         extra_usage_utilization: extra_util,
         fetched_at: Local::now(),
@@ -150,6 +189,28 @@ fn window(any: Option<&Value>) -> Option<UsageWindow> {
         utilization,
         resets_at,
     })
+}
+
+/// A `UsageWindow` from a `limits[]` entry: reads `percent` (NOT `utilization`)
+/// plus `resets_at`. Returns `None` when `percent` is absent.
+fn limit_window_entry(entry: &Value) -> Option<UsageWindow> {
+    let percent = entry.get("percent").and_then(Value::as_f64)?;
+    let resets_at = entry
+        .get("resets_at")
+        .and_then(Value::as_str)
+        .and_then(parse_iso8601);
+    Some(UsageWindow {
+        utilization: Some(percent),
+        resets_at,
+    })
+}
+
+/// The first `limits[]` entry whose `kind` matches, as a `UsageWindow`.
+fn limit_window_by_kind(limits: &[Value], kind: &str) -> Option<UsageWindow> {
+    limits
+        .iter()
+        .find(|e| e.get("kind").and_then(Value::as_str) == Some(kind))
+        .and_then(limit_window_entry)
 }
 
 /// Parse an ISO-8601 / RFC-3339 timestamp (with or without fractional seconds).
@@ -199,4 +260,62 @@ pub async fn refresh(client: &reqwest::Client, refresh_token: &str) -> Result<Re
             .map(String::from),
         expires_at_ms: (now_secs() + expires_in) * 1000.0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_scoped_weekly_limit() {
+        let data = br#"{
+          "five_hour": {"utilization": 64.0, "resets_at": "2026-07-02T00:50:00.818202+00:00"},
+          "seven_day": {"utilization": 7.0, "resets_at": "2026-07-05T00:00:00+00:00"},
+          "limits": [
+            {"kind": "session", "group": "session", "percent": 64, "resets_at": "2026-07-02T00:50:00.818202+00:00"},
+            {"kind": "weekly_all", "group": "weekly", "percent": 7, "resets_at": "2026-07-05T00:00:00+00:00"},
+            {"kind": "weekly_scoped", "group": "weekly", "percent": 13,
+             "resets_at": "2026-07-05T00:00:00+00:00",
+             "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}
+          ]
+        }"#;
+        let report = parse(data).expect("valid payload");
+        assert_eq!(report.scoped.len(), 1);
+        assert_eq!(report.scoped[0].label, "Fable");
+        assert_eq!(report.scoped[0].window.utilization, Some(13.0));
+        assert!(report.scoped[0].window.resets_at.is_some());
+        // Legacy top-level fields are preferred over the limits[] fallback.
+        assert_eq!(report.five_hour.and_then(|w| w.utilization), Some(64.0));
+        // 6-digit fractional-second reset parses.
+        assert!(report.five_hour.and_then(|w| w.resets_at).is_some());
+    }
+
+    #[test]
+    fn scoped_label_falls_back_to_scoped() {
+        let data = br#"{"limits": [{"kind": "weekly_scoped", "percent": 5}]}"#;
+        let report = parse(data).expect("valid payload");
+        assert_eq!(report.scoped.len(), 1);
+        assert_eq!(report.scoped[0].label, "Scoped");
+        assert_eq!(report.scoped[0].window.utilization, Some(5.0));
+    }
+
+    #[test]
+    fn falls_back_to_limits_for_main_windows() {
+        let data = br#"{"limits": [
+          {"kind": "session", "percent": 42, "resets_at": "2026-07-02T00:50:00+00:00"},
+          {"kind": "weekly_all", "percent": 24}
+        ]}"#;
+        let report = parse(data).expect("valid payload");
+        assert_eq!(report.five_hour.and_then(|w| w.utilization), Some(42.0));
+        assert!(report.five_hour.and_then(|w| w.resets_at).is_some());
+        assert_eq!(report.seven_day.and_then(|w| w.utilization), Some(24.0));
+    }
+
+    #[test]
+    fn unknown_limit_kinds_ignored() {
+        let data = br#"{"limits": [{"kind": "hourly_lunar", "percent": 99}], "five_hour": {"utilization": 1}}"#;
+        let report = parse(data).expect("valid payload");
+        assert!(report.scoped.is_empty());
+        assert_eq!(report.max_utilization(), 1.0);
+    }
 }
