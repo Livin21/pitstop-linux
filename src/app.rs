@@ -1153,7 +1153,9 @@ impl Engine {
 
             let mut extras: Vec<String> = Vec::new();
             if report.extra_usage_enabled {
-                extras.push(format!("Extra {}", format::percent(report.extra_usage_utilization)));
+                if let Some(v) = report.extra_usage_utilization {
+                    extras.push(format!("Extra {}", format::percent(Some(v))));
+                }
             }
             if !extras.is_empty() {
                 detail.push(format!("       {}", extras.join(" · ")));
@@ -1183,12 +1185,12 @@ impl Engine {
 
     fn row_status(&self, account: &MenuAccount, key: &str, data_date: Option<DateTime<Local>>) -> Option<String> {
         if account.is_codex() && account.is_active && self.needs_action.contains(key) {
+            // The live token on disk is stale and PitStop won't rotate it out
+            // from under Codex — show the last-known bars with a "Last seen"
+            // stamp until Codex saves a fresh token, not the token mechanics.
             return Some(match data_date {
-                Some(d) => format!(
-                    "Usage updates when Codex next saves its token · last seen {}",
-                    format::updated(d)
-                ),
-                None => "Usage updates when Codex next saves its token".into(),
+                Some(d) => format!("Last seen {}", format::short_clock(d)),
+                None => "No usage data yet".into(),
             });
         }
         if let Some(err) = self.fetch_error.get(key) {
@@ -1203,10 +1205,16 @@ impl Engine {
                     };
                 }
             }
-            return Some(match data_date {
-                Some(d) => format!("⚠︎ {text} · showing {} data", format::updated(d)),
-                None => format!("⚠︎ {text}"),
-            });
+            // Data under 10 minutes old needs no staleness caveat, and a
+            // transient hiccup with fresh data isn't worth the orange ⚠︎.
+            let age = data_date.map(|d| (Local::now() - d).num_seconds());
+            if error_is_stale(self.needs_action.contains(key), age) {
+                return Some(match data_date {
+                    Some(d) => format!("⚠︎ {text} · showing {} data", format::short_clock(d)),
+                    None => format!("⚠︎ {text}"),
+                });
+            }
+            return Some(text);
         }
         if data_date.is_none() {
             return Some("Loading…".into());
@@ -1555,8 +1563,18 @@ fn bar(pct: Option<f64>) -> String {
     }
 }
 
+/// Whether a fetch error for a row should render as a stale ⚠︎ warning rather
+/// than a muted info line: needs-action rows, rows with no cached data, and data
+/// older than 600 s stay warnings; a transient hiccup with fresh data is muted.
+/// Pure so it's unit-testable.
+fn error_is_stale(needs_action: bool, data_age_secs: Option<i64>) -> bool {
+    needs_action || data_age_secs.is_none_or(|a| a > 600)
+}
+
 fn dot(pct: Option<f64>) -> &'static str {
-    match pct {
+    // Threshold on the rounded value — the same number the text shows — so a
+    // displayed "90%" is never coloured as if it were 89.
+    match pct.map(f64::round) {
         Some(p) if p >= 90.0 => "🔴",
         Some(p) if p >= 70.0 => "🟠",
         Some(_) => "🟢",
@@ -2123,6 +2141,26 @@ mod tests {
         // 2% used but ~49%/h → ETA ~2h: close enough to warn even below 25%.
         let samples = rising_at(49.0, 20.0, 2.0);
         assert!(projected_full_from_samples(&samples, 2.0, None).is_some());
+    }
+
+    // ── error_is_stale (Task 10) ───────────────────────────────────────────
+
+    #[test]
+    fn error_is_stale_gates_on_age_and_needs_action() {
+        assert!(error_is_stale(true, Some(10)));    // needs-action always warns
+        assert!(error_is_stale(false, None));       // no cached data → warn
+        assert!(error_is_stale(false, Some(700)));  // >600s old → warn
+        assert!(!error_is_stale(false, Some(300))); // fresh transient → muted
+        assert!(!error_is_stale(false, Some(600))); // exactly 600 (not >600) → muted
+    }
+
+    #[test]
+    fn dot_thresholds_on_rounded_percent() {
+        assert_eq!(dot(Some(89.6)), "🔴"); // rounds to 90
+        assert_eq!(dot(Some(89.4)), "🟠");
+        assert_eq!(dot(Some(69.6)), "🟠"); // rounds to 70
+        assert_eq!(dot(Some(69.4)), "🟢");
+        assert_eq!(dot(None), "▫");
     }
 
     #[test]
