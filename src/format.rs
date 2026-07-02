@@ -35,8 +35,10 @@ pub fn relative(seconds: f64) -> String {
         format!("in {h}h {m}m")
     } else if m > 0 {
         format!("in {m}m")
-    } else {
+    } else if total > 0 {
         format!("in {total}s")
+    } else {
+        "now".to_string()
     }
 }
 
@@ -63,8 +65,10 @@ pub fn relative_short(seconds: f64) -> String {
         format!("{d}d {h}h")
     } else if h > 0 {
         format!("{h}h {m}m")
-    } else {
+    } else if m > 0 {
         format!("{m}m")
+    } else {
+        "<1m".to_string()
     }
 }
 
@@ -82,6 +86,23 @@ pub fn short_clock(date: DateTime<Local>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_now_and_seconds() {
+        assert_eq!(relative(-5.0), "now");
+        assert_eq!(relative(0.0), "now");
+        assert_eq!(relative(45.0), "in 45s");
+        assert_eq!(relative(300.0), "in 5m");
+    }
+
+    #[test]
+    fn relative_short_sub_minute_and_elapsed() {
+        assert_eq!(relative_short(45.0), "<1m");
+        assert_eq!(relative_short(-90.0), "<1m");
+        assert_eq!(relative_short(60.0), "1m");
+        assert_eq!(relative_short(3.0 * 3600.0 + 34.0 * 60.0), "3h 34m");
+        assert_eq!(relative_short(5.0 * 86400.0 + 16.0 * 3600.0), "5d 16h");
+    }
 
     #[test]
     fn short_clock_has_one_colon_and_am_pm() {
