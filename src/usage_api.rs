@@ -45,8 +45,8 @@ pub struct UsageWindow {
 /// `weekly_scoped` entries. An independent cap: hitting it blocks only that
 /// model, but per user preference it still counts toward the binding number.
 #[derive(Clone)]
-#[allow(dead_code)] // consumed by later tasks (tray display)
 pub struct ScopedWindow {
+    #[allow(dead_code)] // consumed by later tasks (tray display)
     pub label: String,
     pub window: UsageWindow,
 }
@@ -55,7 +55,6 @@ pub struct ScopedWindow {
 pub struct UsageReport {
     pub five_hour: Option<UsageWindow>,
     pub seven_day: Option<UsageWindow>,
-    #[allow(dead_code)] // consumed by later tasks (tray display)
     pub scoped: Vec<ScopedWindow>,
     pub extra_usage_enabled: bool,
     pub extra_usage_utilization: Option<f64>,
@@ -63,22 +62,32 @@ pub struct UsageReport {
 }
 
 impl UsageReport {
-    /// The binding constraint — whichever window is closest to its limit.
+    /// The binding constraint — whichever window is closest to its limit,
+    /// now including per-model scoped weekly limits (Fable).
     pub fn max_utilization(&self) -> f64 {
-        let a = self.five_hour.and_then(|w| w.utilization).unwrap_or(0.0);
-        let b = self.seven_day.and_then(|w| w.utilization).unwrap_or(0.0);
-        a.max(b)
+        self.binding_window()
+            .and_then(|w| w.utilization)
+            .unwrap_or(0.0)
     }
 
     /// The window driving `max_utilization`, for reset-time display.
+    /// First-wins on ties, so 5h beats 7d beats scoped at equal utilization.
     pub fn binding_window(&self) -> Option<UsageWindow> {
-        let a = self.five_hour.and_then(|w| w.utilization).unwrap_or(0.0);
-        let b = self.seven_day.and_then(|w| w.utilization).unwrap_or(0.0);
-        if a >= b {
-            self.five_hour
-        } else {
-            self.seven_day
+        let mut best: Option<UsageWindow> = None;
+        let candidates = [self.five_hour, self.seven_day]
+            .into_iter()
+            .flatten()
+            .chain(self.scoped.iter().map(|s| s.window));
+        for w in candidates {
+            let is_better = match best {
+                None => true,
+                Some(b) => w.utilization.unwrap_or(0.0) > b.utilization.unwrap_or(0.0),
+            };
+            if is_better {
+                best = Some(w);
+            }
         }
+        best
     }
 }
 
@@ -317,5 +326,17 @@ mod tests {
         let report = parse(data).expect("valid payload");
         assert!(report.scoped.is_empty());
         assert_eq!(report.max_utilization(), 1.0);
+    }
+
+    #[test]
+    fn binding_includes_scoped() {
+        let data = br#"{"five_hour": {"utilization": 10}, "seven_day": {"utilization": 20},
+         "limits": [{"kind": "weekly_scoped", "percent": 95,
+                     "resets_at": "2026-07-05T00:00:00+00:00",
+                     "scope": {"model": {"display_name": "Fable"}}}]}"#;
+        let report = parse(data).expect("valid payload");
+        assert_eq!(report.max_utilization(), 95.0);
+        // Fable's reset stamp drives threshold notifications when it is binding.
+        assert!(report.binding_window().and_then(|w| w.resets_at).is_some());
     }
 }

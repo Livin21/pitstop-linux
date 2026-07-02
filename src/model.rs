@@ -146,7 +146,8 @@ impl IndicatorMetric {
         match self {
             IndicatorMetric::Binding => {
                 let has = report.five_hour.and_then(|w| w.utilization).is_some()
-                    || report.seven_day.and_then(|w| w.utilization).is_some();
+                    || report.seven_day.and_then(|w| w.utilization).is_some()
+                    || report.scoped.iter().any(|s| s.window.utilization.is_some());
                 if has {
                     Some(report.max_utilization())
                 } else {
@@ -213,6 +214,37 @@ mod tests {
                 p.title()
             );
         }
+    }
+
+    #[test]
+    fn binding_metric_has_data_from_scoped_only() {
+        use crate::usage_api::{ScopedWindow, UsageReport, UsageWindow};
+        let report = UsageReport {
+            five_hour: None,
+            seven_day: None,
+            scoped: vec![ScopedWindow {
+                label: "Fable".into(),
+                window: UsageWindow { utilization: Some(42.0), resets_at: None },
+            }],
+            extra_usage_enabled: false,
+            extra_usage_utilization: None,
+            fetched_at: chrono::Local::now(),
+        };
+        assert_eq!(IndicatorMetric::Binding.utilization(&report), Some(42.0));
+    }
+
+    #[test]
+    fn binding_metric_none_without_any_data() {
+        use crate::usage_api::UsageReport;
+        let report = UsageReport {
+            five_hour: None,
+            seven_day: None,
+            scoped: vec![],
+            extra_usage_enabled: false,
+            extra_usage_utilization: None,
+            fetched_at: chrono::Local::now(),
+        };
+        assert_eq!(IndicatorMetric::Binding.utilization(&report), None);
     }
 
     #[test]
