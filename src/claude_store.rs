@@ -114,6 +114,32 @@ fn write_live(data: &[u8]) -> Result<()> {
     write_atomic(&live_creds_path(), data, Some(0o600))
 }
 
+/// Write the target's live blob, then apply its identity. If applying the
+/// identity fails, restore `previous` so `~/.claude/.credentials.json` and
+/// `~/.claude.json` can't disagree (a mismatched pair makes the next
+/// `capture_current` file the new tokens under the old profile), then surface
+/// the original error. Generic over the write/apply closures so the rollback is
+/// testable without the real files.
+fn write_then_set_identity<W, S>(
+    previous: Option<Vec<u8>>,
+    blob: &[u8],
+    write_live: W,
+    set_identity: S,
+) -> Result<()>
+where
+    W: Fn(&[u8]) -> Result<()>,
+    S: FnOnce() -> Result<()>,
+{
+    write_live(blob)?;
+    if let Err(e) = set_identity() {
+        if let Some(prev) = previous {
+            let _ = write_live(&prev);
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
 pub struct ProfileStore {
     pub profiles: Vec<Profile>,
 }
@@ -205,8 +231,12 @@ impl ProfileStore {
                 "No saved credentials for {email} — log in once with `claude` and save again"
             ));
         };
-        write_live(&blob)?;
-        credentials::set_oauth_account(&account)
+        write_then_set_identity(
+            read_live(),
+            &blob,
+            write_live,
+            || credentials::set_oauth_account(&account),
+        )
     }
 
     /// The blob to fetch usage with — the live file for the active account,
@@ -233,5 +263,48 @@ impl ProfileStore {
         secret_store::delete(PROVIDER, email)?;
         self.profiles.retain(|p| p.email != email);
         self.save()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn switch_rollback_restores_previous_live_when_identity_fails() {
+        let writes: RefCell<Vec<Vec<u8>>> = RefCell::new(Vec::new());
+        let err = write_then_set_identity(
+            Some(b"PREVIOUS".to_vec()),
+            b"NEW",
+            |d| {
+                writes.borrow_mut().push(d.to_vec());
+                Ok(())
+            },
+            || Err(anyhow!("identity write failed")),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("identity write failed"));
+        // New blob written first, then the previous blob restored.
+        assert_eq!(writes.borrow().len(), 2);
+        assert_eq!(writes.borrow()[0], b"NEW");
+        assert_eq!(writes.borrow()[1], b"PREVIOUS");
+    }
+
+    #[test]
+    fn switch_commits_without_rollback_on_success() {
+        let writes: RefCell<Vec<Vec<u8>>> = RefCell::new(Vec::new());
+        write_then_set_identity(
+            Some(b"PREVIOUS".to_vec()),
+            b"NEW",
+            |d| {
+                writes.borrow_mut().push(d.to_vec());
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(writes.borrow().len(), 1);
+        assert_eq!(writes.borrow()[0], b"NEW");
     }
 }
