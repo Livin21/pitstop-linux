@@ -20,6 +20,7 @@ mod util;
 mod updater;
 
 use anyhow::Result;
+use std::path::Path;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -41,8 +42,49 @@ async fn main() -> Result<()> {
     run_tray().await
 }
 
+/// Take an exclusive advisory `flock` on `path` (created 0600). Returns `true`
+/// when we now hold it — or when the lock file can't even be created (fail open:
+/// never block startup on a lock we couldn't take). Returns `false` only when
+/// another live process already holds it. The fd is deliberately leaked so the
+/// lock is held for the whole process; the kernel releases it on exit, so a
+/// crash can't wedge future launches.
+fn acquire_lock_at(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let mut c: Vec<u8> = path.as_os_str().as_bytes().to_vec();
+    c.push(0);
+    unsafe {
+        let fd = libc::open(
+            c.as_ptr() as *const libc::c_char,
+            libc::O_CREAT | libc::O_RDWR,
+            0o600,
+        );
+        if fd < 0 {
+            return true; // couldn't create the lock file — don't block startup
+        }
+        if libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) != 0 {
+            libc::close(fd);
+            return false;
+        }
+        // Leak `fd`: closing it would release the lock. Held until the process exits.
+    }
+    true
+}
+
+/// Refuse to run a second tray beside a live one — two instances fight over the
+/// live credential files with independent auto-switch clocks. One-shot flags
+/// return before this in `main()`, so they never take the lock.
+fn single_instance_ok() -> bool {
+    let dir = util::config_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    acquire_lock_at(&dir.join("pitstop.lock"))
+}
+
 /// Register the tray icon and hand control to the engine's refresh loop.
 async fn run_tray() -> Result<()> {
+    if !single_instance_ok() {
+        println!("another PitStop instance is running");
+        return Ok(());
+    }
     use ksni::TrayMethods;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let tray = tray::PitStopTray {
@@ -400,5 +442,23 @@ fn print_gemini_usage(usage: &gemini::Usage) {
             format::percent(Some(w.used_percent)),
             format::reset(w.resets_at)
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_instance_lock_is_exclusive() {
+        let path = std::env::temp_dir()
+            .join(format!("pitstop-lock-test-{}.lock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(acquire_lock_at(&path), "first acquire should hold the lock");
+        assert!(
+            !acquire_lock_at(&path),
+            "a second acquire while the first fd is held must fail"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
