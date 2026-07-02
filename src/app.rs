@@ -217,9 +217,15 @@ impl Engine {
                     let _ = self.store.remove(&key);
                     self.usage.remove(&key);
                 }
-                self.fetch_error.remove(&key);
-                self.next_fetch_allowed.remove(&key);
-                self.failure_count.remove(&key);
+                prune_account_state(
+                    &mut self.fetch_error,
+                    &mut self.next_fetch_allowed,
+                    &mut self.failure_count,
+                    &mut self.needs_action,
+                    &mut self.notified_bucket,
+                    &mut self.usage_history,
+                    &key,
+                );
                 self.render().await;
             }
             Action::OpenUrl(url) => {
@@ -1431,6 +1437,30 @@ fn record_window_sample(
     entry.retain(|(t, _)| now.duration_since(*t).as_secs_f64() <= 1800.0);
 }
 
+/// Drop every per-account state entry keyed on `key` when an account is removed
+/// (its usage is already dropped by the caller from the provider-specific map).
+/// Without this, `needs_action`, `notified_bucket`, and `usage_history`
+/// (`"{key}#…"`) entries linger and keep driving the most-urgent reading and
+/// projections for a ghost account. Free function so it's unit-testable.
+#[allow(clippy::too_many_arguments)]
+fn prune_account_state(
+    fetch_error: &mut HashMap<String, String>,
+    next_fetch_allowed: &mut HashMap<String, Instant>,
+    failure_count: &mut HashMap<String, u32>,
+    needs_action: &mut HashSet<String>,
+    notified_bucket: &mut HashMap<String, u8>,
+    usage_history: &mut HashMap<String, Vec<(Instant, f64)>>,
+    key: &str,
+) {
+    fetch_error.remove(key);
+    next_fetch_allowed.remove(key);
+    failure_count.remove(key);
+    needs_action.remove(key);
+    notified_bucket.remove(key);
+    let prefix = format!("{key}#");
+    usage_history.retain(|k, _| !k.starts_with(&prefix));
+}
+
 /// Least-squares slope (utilisation % per second) over time-stamped samples.
 /// Returns `None` when all samples share the same timestamp (degenerate).
 /// Matches the Swift `slopePerSecond` in AppDelegate.swift (v0.3.1 diff).
@@ -2093,5 +2123,37 @@ mod tests {
         // 2% used but ~49%/h → ETA ~2h: close enough to warn even below 25%.
         let samples = rising_at(49.0, 20.0, 2.0);
         assert!(projected_full_from_samples(&samples, 2.0, None).is_some());
+    }
+
+    #[test]
+    fn prune_account_state_clears_all_keyed_entries() {
+        let mut fe: HashMap<String, String> = HashMap::new();
+        let mut nfa: HashMap<String, Instant> = HashMap::new();
+        let mut fc: HashMap<String, u32> = HashMap::new();
+        let mut na: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut nb: HashMap<String, u8> = HashMap::new();
+        let mut uh: History = HashMap::new();
+        let now = Instant::now();
+        let key = "codex:me@x.com";
+        fe.insert(key.into(), "err".into());
+        nfa.insert(key.into(), now);
+        fc.insert(key.into(), 3);
+        na.insert(key.into());
+        nb.insert(key.into(), 2);
+        uh.insert(format!("{key}#5h"), vec![(now, 10.0)]);
+        // Unrelated account state must survive.
+        uh.insert("other@x#7d".into(), vec![(now, 5.0)]);
+        fe.insert("other@x".into(), "keep".into());
+
+        prune_account_state(&mut fe, &mut nfa, &mut fc, &mut na, &mut nb, &mut uh, key);
+
+        assert!(!fe.contains_key(key));
+        assert!(!nfa.contains_key(key));
+        assert!(!fc.contains_key(key));
+        assert!(!na.contains(key));
+        assert!(!nb.contains_key(key));
+        assert!(!uh.contains_key(&format!("{key}#5h")));
+        assert!(uh.contains_key("other@x#7d"));
+        assert!(fe.contains_key("other@x"));
     }
 }
