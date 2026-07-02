@@ -1369,6 +1369,12 @@ fn projected_full_from_samples(
     if secs_to_full <= 0.0 {
         return None;
     }
+    // A barely-used window projecting far into the future is noise, not a
+    // warning — only surface once the window is meaningfully used (>= 25 %) or
+    // the limit is genuinely close (ETA <= 3 h). Matches macOS d062687.
+    if current < 25.0 && secs_to_full > 10800.0 {
+        return None;
+    }
     let projected = Local::now() + chrono::Duration::seconds(secs_to_full as i64);
     if let Some(reset) = resets_at {
         if projected >= reset.with_timezone(&Local) {
@@ -2023,5 +2029,43 @@ mod tests {
         assert!(lines[0].contains("13%"), "line 0 should show the percent: {}", lines[0]);
         assert!(lines[1].contains("Opus"));
         assert!(lines[1].contains("40%"));
+    }
+
+    // ── projected_full_from_samples — projection floor ─────────────────────
+
+    /// Five evenly-spaced samples rising at `rate_per_hour` %/h over the past
+    /// `minutes`, ending at `ending_at`. Least-squares slope over a perfectly
+    /// linear series equals the true slope, so gate math is exact.
+    fn rising_at(rate_per_hour: f64, minutes: f64, ending_at: f64) -> Vec<(Instant, f64)> {
+        let now = Instant::now();
+        (0..=4)
+            .map(|i| {
+                let m = -minutes + (i as f64) * (minutes / 4.0); // -minutes ..= 0
+                let secs_ago = (-m * 60.0).round() as u64;
+                let t = now - Duration::from_secs(secs_ago);
+                (t, ending_at + rate_per_hour * (m / 60.0))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn floor_low_use_far_eta_returns_none() {
+        // 2% used, ~11%/h → ETA ~9h out: below 25% and beyond 3h → suppressed.
+        let samples = rising_at(11.0, 20.0, 2.0);
+        assert!(projected_full_from_samples(&samples, 2.0, None).is_none());
+    }
+
+    #[test]
+    fn floor_hot_window_projects() {
+        // Same slope but already 26% used → above the floor → projects.
+        let samples = rising_at(11.0, 20.0, 26.0);
+        assert!(projected_full_from_samples(&samples, 26.0, None).is_some());
+    }
+
+    #[test]
+    fn floor_low_use_imminent_eta_projects() {
+        // 2% used but ~49%/h → ETA ~2h: close enough to warn even below 25%.
+        let samples = rising_at(49.0, 20.0, 2.0);
+        assert!(projected_full_from_samples(&samples, 2.0, None).is_some());
     }
 }
