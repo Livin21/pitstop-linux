@@ -41,6 +41,13 @@ pub fn now_secs() -> f64 {
 /// crash can never leave a half-written file. When `mode` is set, the file is
 /// created with — and forced to — those permissions (e.g. `0o600` for secrets).
 pub fn write_atomic(path: &Path, data: &[u8], mode: Option<u32>) -> Result<()> {
+    // Resolve symlinks so the write lands on the real target: dotfile managers
+    // symlink credential files, and the tmp+rename below would otherwise replace
+    // the symlink node itself with a regular file, forking state. `canonicalize`
+    // errors on a path that doesn't exist yet — fall back to the path as-is then.
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = resolved.as_path();
+
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
     let stem = path
@@ -65,4 +72,38 @@ pub fn write_atomic(path: &Path, data: &[u8], mode: Option<u32>) -> Result<()> {
     }
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn write_atomic_preserves_symlink() {
+        let dir = std::env::temp_dir().join(format!("pitstop-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.json");
+        let link = dir.join("link.json");
+        std::fs::write(&real, b"old").unwrap();
+        symlink(&real, &link).unwrap();
+
+        write_atomic(&link, b"new", Some(0o600)).unwrap();
+
+        // The link is STILL a symlink, and its target received the new bytes.
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_writes_plain_file() {
+        let dir = std::env::temp_dir().join(format!("pitstop-atomic-plain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("x.json");
+        write_atomic(&path, b"hello", None).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
