@@ -124,7 +124,8 @@ pub async fn run_login(
                     return finish(http, adapter, target_email, &cap.code, &pkce, &redirect_uri).await;
                 }
                 Err(e) => {
-                    if !adapter.supports_paste() {
+                    // A user-denied sign-in fails fast; it must not fall back to paste.
+                    if e.downcast_ref::<loopback::Denied>().is_some() || !adapter.supports_paste() {
                         return Err(e);
                     }
                     // fall through to paste

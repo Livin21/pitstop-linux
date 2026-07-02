@@ -29,6 +29,54 @@ pub fn parse_query(query: &str) -> Option<Callback> {
     Some(Callback { code: code?, state: state? })
 }
 
+/// A user-denied sign-in: the callback carried `?error=…` (the consent page's
+/// Deny button) instead of a code. Distinguished from a timeout so the login
+/// coordinator can fail fast rather than waiting out the deadline or falling
+/// back to paste.
+#[derive(Debug)]
+pub struct Denied;
+impl std::fmt::Display for Denied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Sign-in was cancelled")
+    }
+}
+impl std::error::Error for Denied {}
+
+/// What one HTTP request to the loopback means to the wait loop.
+pub enum Outcome {
+    Captured(Callback),
+    Denied,
+    NotCallback,
+}
+
+/// Classify an HTTP request line (`GET /path?query HTTP/1.1`): a parseable
+/// `code`+`state` is the callback; a query carrying `error` is a denial;
+/// anything else (favicon, browser preconnect probes) keeps the loop waiting.
+pub fn classify(request_line: &str) -> Outcome {
+    let Some(query) = request_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|p| p.split_once('?'))
+        .map(|(_, q)| q)
+    else {
+        return Outcome::NotCallback;
+    };
+    if let Some(c) = parse_query(query) {
+        return Outcome::Captured(c);
+    }
+    if query_has_error(query) {
+        return Outcome::Denied;
+    }
+    Outcome::NotCallback
+}
+
+fn query_has_error(query: &str) -> bool {
+    reqwest::Url::parse(&format!("http://127.0.0.1/?{query}"))
+        .ok()
+        .map(|u| u.query_pairs().any(|(k, _)| k == "error"))
+        .unwrap_or(false)
+}
+
 pub struct Loopback {
     listener: TcpListener,
     pub port: u16,
@@ -61,11 +109,6 @@ impl Loopback {
                 let n = stream.read(&mut buf).await.unwrap_or(0);
                 let text = String::from_utf8_lossy(&buf[..n]);
                 let first = text.lines().next().unwrap_or("");
-                let cap = first
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|path| path.split_once('?'))
-                    .and_then(|(_, q)| parse_query(q));
                 let body = "You can close this tab and return to PitStop.";
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -73,8 +116,10 @@ impl Loopback {
                 );
                 let _ = stream.write_all(resp.as_bytes()).await;
                 let _ = stream.shutdown().await;
-                if let Some(c) = cap {
-                    return Ok::<Callback, anyhow::Error>(c);
+                match classify(first) {
+                    Outcome::Captured(c) => return Ok::<Callback, anyhow::Error>(c),
+                    Outcome::Denied => return Err(anyhow::Error::new(Denied)),
+                    Outcome::NotCallback => {}
                 }
             }
         };
@@ -178,5 +223,37 @@ mod tests {
     #[test]
     fn parse_query_missing_state_is_none() {
         assert!(parse_query("code=abc").is_none());
+    }
+
+    #[test]
+    fn classify_captures_code_and_state() {
+        match classify("GET /callback?code=abc&state=xyz HTTP/1.1") {
+            Outcome::Captured(c) => {
+                assert_eq!(c.code, "abc");
+                assert_eq!(c.state, "xyz");
+            }
+            _ => panic!("expected Captured"),
+        }
+    }
+
+    #[test]
+    fn classify_denies_on_error_param() {
+        assert!(matches!(
+            classify("GET /callback?error=access_denied&state=xyz HTTP/1.1"),
+            Outcome::Denied
+        ));
+    }
+
+    #[test]
+    fn classify_ignores_non_callback() {
+        assert!(matches!(classify("GET /favicon.ico HTTP/1.1"), Outcome::NotCallback));
+        assert!(matches!(classify("GET / HTTP/1.1"), Outcome::NotCallback));
+    }
+
+    #[test]
+    fn denied_downcasts_and_reads_as_cancelled() {
+        assert_eq!(Denied.to_string(), "Sign-in was cancelled");
+        let e = anyhow::Error::new(Denied);
+        assert!(e.downcast_ref::<Denied>().is_some());
     }
 }
