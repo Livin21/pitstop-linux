@@ -81,9 +81,12 @@ async fn check() {
             profile.plan_label()
         );
         match check_claude(&client, &store, &profile.email, is_active).await {
-            Ok((five, seven)) => {
+            Ok((five, seven, scoped)) => {
                 println!("   5-hour  {five}");
                 println!("   weekly  {seven}");
+                for line in &scoped {
+                    println!("   {line}");
+                }
             }
             Err(e) => println!("   error: {e}"),
         }
@@ -261,7 +264,7 @@ async fn check_claude(
     store: &claude_store::ProfileStore,
     email: &str,
     is_active: bool,
-) -> Result<(String, String), String> {
+) -> Result<(String, String, Vec<String>), String> {
     let blob = store
         .blob(email, is_active)
         .map_err(|e| e.to_string())?
@@ -299,7 +302,19 @@ async fn check_claude(
         format::percent(report.seven_day.and_then(|w| w.utilization)),
         format::reset(report.seven_day.and_then(|w| w.resets_at))
     );
-    Ok((five, seven))
+    let scoped: Vec<String> = report
+        .scoped
+        .iter()
+        .map(|s| {
+            format!(
+                "{}  {}  {}",
+                s.label,
+                format::percent(s.window.utilization),
+                format::reset(s.window.resets_at)
+            )
+        })
+        .collect();
+    Ok((five, seven, scoped))
 }
 
 async fn check_codex(

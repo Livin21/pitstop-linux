@@ -617,6 +617,11 @@ impl Engine {
             if let Some(u) = report.seven_day.and_then(|w| w.utilization) {
                 windows.push((key.clone(), "7d".to_string(), u));
             }
+            for s in &report.scoped {
+                if let Some(u) = s.window.utilization {
+                    windows.push((key.clone(), s.label.clone(), u));
+                }
+            }
         }
         for (key, cu) in &self.codex_usage {
             if self.fetch_error.contains_key(key) {
@@ -680,6 +685,11 @@ impl Engine {
             }
             if let Some(u) = report.seven_day.and_then(|w| w.utilization) {
                 v.push(("7d".to_string(), u, report.seven_day.and_then(|w| w.resets_at)));
+            }
+            for s in &report.scoped {
+                if let Some(u) = s.window.utilization {
+                    v.push((s.label.clone(), u, s.window.resets_at));
+                }
             }
             return v;
         }
@@ -1105,6 +1115,10 @@ impl Engine {
             let f7 = report.seven_day.and_then(|w| w.utilization);
             detail.push(window_line("7d", f7, report.seven_day.and_then(|w| w.resets_at)));
 
+            for line in scoped_window_lines(report) {
+                detail.push(line);
+            }
+
             let mut extras: Vec<String> = Vec::new();
             if report.extra_usage_enabled {
                 extras.push(format!("Extra {}", format::percent(report.extra_usage_utilization)));
@@ -1243,6 +1257,9 @@ impl Engine {
             format::percent(report.five_hour.and_then(|w| w.utilization)),
             format::percent(report.seven_day.and_then(|w| w.utilization))
         );
+        for s in &report.scoped {
+            tip += &format!(" · {} {}", s.label, format::percent(s.window.utilization));
+        }
         if let Some(err) = self.fetch_error.get(email) {
             tip += &format!("\n⚠ {err} — showing data from {}", format::updated(report.fetched_at));
         }
@@ -1443,6 +1460,15 @@ fn gemini_detail_lines(usage: &gemini::Usage) -> Vec<String> {
         lines.push(format!("       {extras}"));
     }
     lines
+}
+
+/// One detail bar line per scoped weekly limit (Fable, …), in report order.
+fn scoped_window_lines(report: &UsageReport) -> Vec<String> {
+    report
+        .scoped
+        .iter()
+        .map(|s| window_line(&s.label, s.window.utilization, s.window.resets_at))
+        .collect()
 }
 
 fn window_line(label: &str, pct: Option<f64>, resets_at: Option<DateTime<chrono::Utc>>) -> String {
@@ -1969,5 +1995,33 @@ mod tests {
         assert!(!nfa.contains_key(key), "backoff should be cleared");
         assert_eq!(fc[key], 0, "failure count reset to zero");
         assert!(!na.contains(key), "needs_action flag cleared");
+    }
+
+    #[test]
+    fn scoped_window_lines_one_per_scoped() {
+        use crate::usage_api::{ScopedWindow, UsageReport, UsageWindow};
+        let report = UsageReport {
+            five_hour: None,
+            seven_day: None,
+            scoped: vec![
+                ScopedWindow {
+                    label: "Fable".into(),
+                    window: UsageWindow { utilization: Some(13.0), resets_at: None },
+                },
+                ScopedWindow {
+                    label: "Opus".into(),
+                    window: UsageWindow { utilization: Some(40.0), resets_at: None },
+                },
+            ],
+            extra_usage_enabled: false,
+            extra_usage_utilization: None,
+            fetched_at: Local::now(),
+        };
+        let lines = scoped_window_lines(&report);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("Fable"), "line 0 should name the model: {}", lines[0]);
+        assert!(lines[0].contains("13%"), "line 0 should show the percent: {}", lines[0]);
+        assert!(lines[1].contains("Opus"));
+        assert!(lines[1].contains("40%"));
     }
 }

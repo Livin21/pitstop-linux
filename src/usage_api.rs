@@ -46,7 +46,6 @@ pub struct UsageWindow {
 /// model, but per user preference it still counts toward the binding number.
 #[derive(Clone)]
 pub struct ScopedWindow {
-    #[allow(dead_code)] // consumed by later tasks (tray display)
     pub label: String,
     pub window: UsageWindow,
 }
