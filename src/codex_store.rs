@@ -137,7 +137,7 @@ impl CodexStore {
                 "No saved credentials for {email} — sign in once with `codex` and save again"
             ));
         };
-        write_live(&blob)
+        write_live(&codex::preserving_api_key(codex::live_blob().as_deref(), &blob))
     }
 
     /// The blob to fetch usage with — the live file for the active account,

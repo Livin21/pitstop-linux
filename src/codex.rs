@@ -95,6 +95,35 @@ pub fn normalized_blob(data: &[u8]) -> Vec<u8> {
     }
 }
 
+/// If the live `auth.json` carries a non-empty `OPENAI_API_KEY` that the saved
+/// snapshot lacks, carry it into the blob being written — a switch must not
+/// destroy API-key auth that only ever lived in the file (`credentials()`
+/// returns `None` for it, so `capture_current` can't snapshot it). A non-empty
+/// key already in the saved blob wins. Output is compact, key-sorted JSON.
+pub fn preserving_api_key(live: Option<&[u8]>, blob: &[u8]) -> Vec<u8> {
+    (|| -> Option<Vec<u8>> {
+        let live = live?;
+        let live_root: Value = serde_json::from_slice(live).ok()?;
+        let api_key = live_root.get("OPENAI_API_KEY").and_then(Value::as_str)?;
+        if api_key.is_empty() {
+            return None;
+        }
+        let mut root: Value = serde_json::from_slice(blob).ok()?;
+        let obj = root.as_object_mut()?;
+        let saved_has_key = obj
+            .get("OPENAI_API_KEY")
+            .and_then(Value::as_str)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if saved_has_key {
+            return None;
+        }
+        obj.insert("OPENAI_API_KEY".into(), json!(api_key));
+        serde_json::to_vec(&root).ok()
+    })()
+    .unwrap_or_else(|| blob.to_vec())
+}
+
 /// Parse a ChatGPT (not API-key) Codex auth blob into credentials + identity.
 /// Returns `None` for API-key auth or a blob without ChatGPT tokens.
 pub fn credentials(blob: &[u8]) -> Option<Creds> {
@@ -382,5 +411,30 @@ mod tests {
         let (email, acc) = identity_from_id_token(&jwt).unwrap();
         assert_eq!(email, "p@example.com");
         assert!(acc.is_none());
+    }
+
+    #[test]
+    fn preserving_api_key_merges_when_saved_lacks_key() {
+        let live = br#"{"OPENAI_API_KEY":"sk-live"}"#;
+        let saved = br#"{"tokens":{"access_token":"AT","account_id":"acc","id_token":"x.y.z"}}"#;
+        let root: Value = serde_json::from_slice(&preserving_api_key(Some(live), saved)).unwrap();
+        assert_eq!(root["OPENAI_API_KEY"], "sk-live");
+        assert!(root.get("tokens").is_some());
+    }
+
+    #[test]
+    fn preserving_api_key_saved_key_wins() {
+        let live = br#"{"OPENAI_API_KEY":"sk-live"}"#;
+        let saved = br#"{"OPENAI_API_KEY":"sk-saved"}"#;
+        let root: Value = serde_json::from_slice(&preserving_api_key(Some(live), saved)).unwrap();
+        assert_eq!(root["OPENAI_API_KEY"], "sk-saved");
+    }
+
+    #[test]
+    fn preserving_api_key_noop_without_live_key() {
+        let live = br#"{"tokens":{"access_token":"A"}}"#;
+        let saved = br#"{"tokens":{"access_token":"B"}}"#;
+        assert_eq!(preserving_api_key(Some(live), saved), saved.to_vec());
+        assert_eq!(preserving_api_key(None, saved), saved.to_vec());
     }
 }
