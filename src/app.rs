@@ -193,11 +193,11 @@ impl Engine {
             }
             Action::Save => {
                 match self.store.capture_current() {
-                    Ok(Some(email)) => notify::post(
+                    Ok((Some(email), _)) => notify::post(
                         &format!("Saved {email}"),
                         "This account can now be switched to from PitStop.",
                     ),
-                    Ok(None) => notify::post(
+                    Ok((None, _)) => notify::post(
                         "Nothing to save",
                         "No Claude Code login found. Run `claude` and log in first.",
                     ),
@@ -306,8 +306,15 @@ impl Engine {
 
     async fn fetch_pass(&mut self) {
         self.last_top_level_error = None;
-        if let Err(e) = self.store.capture_current() {
-            self.last_top_level_error = Some(e.to_string());
+        match self.store.capture_current() {
+            Ok((profile, changed)) => {
+                if changed {
+                    if let Some(email) = profile {
+                        self.credentials_renewed(&email);
+                    }
+                }
+            }
+            Err(e) => self.last_top_level_error = Some(e.to_string()),
         }
         self.store.load();
         self.active_email = credentials::active_email();
@@ -350,6 +357,17 @@ impl Engine {
         self.failure_count.insert(key.to_string(), 0);
         self.next_fetch_allowed.remove(key);
         self.needs_action.remove(key);
+    }
+
+    /// The stored credentials for `key` were externally replaced (an external
+    /// `claude`/`codex` re-login, or the provider's own refresh). If the row was
+    /// gated needs-action, the new credentials are the fix — clear the gate so
+    /// this cycle fetches instead of waiting out the hour. Rate-limit backoffs
+    /// (not in `needs_action`) are left alone.
+    fn credentials_renewed(&mut self, key: &str) {
+        if self.needs_action.contains(key) {
+            self.clear_fetch_error(key);
+        }
     }
 
     fn record_fetch_error(&mut self, e: ApiError, key: &str) {
@@ -416,8 +434,15 @@ impl Engine {
         if !codex::is_present() {
             return;
         }
-        if let Err(e) = self.codex_store.capture_current() {
-            self.last_top_level_error = Some(e.to_string());
+        match self.codex_store.capture_current() {
+            Ok((profile, changed)) => {
+                if changed {
+                    if let Some(email) = profile {
+                        self.credentials_renewed(&format!("codex:{email}"));
+                    }
+                }
+            }
+            Err(e) => self.last_top_level_error = Some(e.to_string()),
         }
         self.codex_store.load();
         self.codex_live_email = self.codex_store.live_email();

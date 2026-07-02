@@ -54,6 +54,12 @@ impl CodexProfile {
     }
 }
 
+/// Whether re-capturing the live account would store new bytes: true unless a
+/// saved profile already exists with a byte-identical blob. Pure for testing.
+fn capture_changed(has_profile: bool, stored_eq: bool) -> bool {
+    !(has_profile && stored_eq)
+}
+
 pub struct CodexStore {
     pub profiles: Vec<CodexProfile>,
 }
@@ -95,25 +101,29 @@ impl CodexStore {
             .map(|c| c.email)
     }
 
-    /// Snapshot the live Codex account. Returns the email when signed in (even
-    /// if unchanged), `None` otherwise. Skips writes when the normalized blob is
-    /// byte-identical to what's already saved.
-    pub fn capture_current(&mut self) -> Result<Option<String>> {
+    /// Snapshot the live Codex account. Returns `(email, changed)`: `email` is
+    /// `Some` when signed in, `changed` is `true` when new bytes were actually
+    /// written. Callers use `changed` to heal a `needs_action` gate placed after
+    /// an external `codex login`.
+    pub fn capture_current(&mut self) -> Result<(Option<String>, bool)> {
         let Some(live) = codex::live_blob() else {
-            return Ok(None);
+            return Ok((None, false));
         };
         let Some(creds) = codex::credentials(&live) else {
-            return Ok(None);
+            return Ok((None, false));
         };
         let email = creds.email.clone();
         let blob = codex::normalized_blob(&live);
 
-        if self.profiles.iter().any(|p| p.email == email) {
+        let has_profile = self.profiles.iter().any(|p| p.email == email);
+        let mut stored_eq = false;
+        if has_profile {
             if let Ok(Some(stored)) = secret_store::read(codex::PROVIDER, &email) {
-                if stored == blob {
-                    return Ok(Some(email));
-                }
+                stored_eq = stored == blob;
             }
+        }
+        if !capture_changed(has_profile, stored_eq) {
+            return Ok((Some(email), false));
         }
 
         secret_store::write(codex::PROVIDER, &email, &blob)?;
@@ -125,7 +135,7 @@ impl CodexStore {
         });
         self.profiles.sort_by(|a, b| a.email.cmp(&b.email));
         self.save()?;
-        Ok(Some(email))
+        Ok((Some(email), true))
     }
 
     /// Make `email` the live Codex account: snapshot whatever's live, then write
@@ -161,5 +171,17 @@ impl CodexStore {
         secret_store::delete(codex::PROVIDER, email)?;
         self.profiles.retain(|p| p.email != email);
         self.save()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_changed_truth_table() {
+        assert!(capture_changed(false, false)); // no profile yet → changed
+        assert!(capture_changed(true, false));  // blob differs → changed
+        assert!(!capture_changed(true, true));  // identical → unchanged
     }
 }

@@ -140,6 +140,13 @@ where
     Ok(())
 }
 
+/// Whether re-capturing the live account would store new bytes: true unless a
+/// saved profile already exists with a byte-identical blob AND matching
+/// identity. Pure so the change-detection is unit-testable.
+fn capture_changed(has_profile: bool, stored_eq: bool, account_eq: bool) -> bool {
+    !(has_profile && stored_eq && account_eq)
+}
+
 pub struct ProfileStore {
     pub profiles: Vec<Profile>,
 }
@@ -174,29 +181,40 @@ impl ProfileStore {
     }
 
     /// Snapshot the live Claude Code credentials + identity into a profile.
-    /// Returns the email when something is logged in (even if unchanged), or
-    /// `None` when nobody is. Skips writes when nothing changed.
-    pub fn capture_current(&mut self) -> Result<Option<String>> {
+    /// Returns `(email, changed)`: `email` is `Some` when someone is logged in,
+    /// `changed` is `true` when new bytes were actually written (i.e. credentials
+    /// differed from the last snapshot). Callers use `changed` to heal a
+    /// `needs_action` gate placed after an external re-login.
+    pub fn capture_current(&mut self) -> Result<(Option<String>, bool)> {
         let Some(blob) = read_live() else {
-            return Ok(None);
+            return Ok((None, false));
         };
         let Some(account) = credentials::oauth_account() else {
-            return Ok(None);
+            return Ok((None, false));
         };
         let Some(email) = account
             .get("emailAddress")
             .and_then(Value::as_str)
             .map(String::from)
         else {
-            return Ok(None);
+            return Ok((None, false));
         };
 
-        if let Some(existing) = self.profiles.iter().find(|p| p.email == email) {
+        let mut account_eq = false;
+        let has_profile = if let Some(existing) = self.profiles.iter().find(|p| p.email == email) {
+            account_eq = existing.oauth_account == account;
+            true
+        } else {
+            false
+        };
+        let mut stored_eq = false;
+        if has_profile {
             if let Ok(Some(stored)) = secret_store::read(PROVIDER, &email) {
-                if stored == blob && existing.oauth_account == account {
-                    return Ok(Some(email));
-                }
+                stored_eq = stored == blob;
             }
+        }
+        if !capture_changed(has_profile, stored_eq, account_eq) {
+            return Ok((Some(email), false));
         }
 
         let creds = credentials::parse_blob(&blob)?;
@@ -211,7 +229,7 @@ impl ProfileStore {
         });
         self.profiles.sort_by(|a, b| a.email.cmp(&b.email));
         self.save()?;
-        Ok(Some(email))
+        Ok((Some(email), true))
     }
 
     /// Make `email` live: snapshot whatever's current, then write the saved blob
@@ -270,6 +288,14 @@ impl ProfileStore {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn capture_changed_truth_table() {
+        assert!(capture_changed(false, false, false)); // no profile yet → changed
+        assert!(capture_changed(true, false, true));   // blob differs → changed
+        assert!(capture_changed(true, true, false));   // identity differs → changed
+        assert!(!capture_changed(true, true, true));   // all match → unchanged
+    }
 
     #[test]
     fn switch_rollback_restores_previous_live_when_identity_fails() {
