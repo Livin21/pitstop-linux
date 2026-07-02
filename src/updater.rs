@@ -263,8 +263,8 @@ mod tests {
     // --- Task 1 ---
 
     #[test]
-    fn cargo_pkg_version_is_0_3_1() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.3.1");
+    fn cargo_pkg_version_is_0_4_1() {
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.4.1");
     }
 
     // --- Task 2 ---

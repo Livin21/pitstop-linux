@@ -1,6 +1,6 @@
 [package]
 name = "pitstop"
-version = "0.3.1"
+version = "0.4.1"
 edition = "2021"
 description = "Linux tray app that tracks AI coding usage limits (Claude Code, OpenAI Codex, Google Gemini) and switches accounts"
 

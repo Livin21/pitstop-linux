@@ -11,6 +11,12 @@ percentage, color-coded; clicking it opens a menu grouped by provider with a
 color-coded usage bar per rate-limit window, and a one-click switch on each
 inactive account.
 
+Claude rows also show any **per-model scoped weekly limits** (e.g. Fable) as
+their own labelled bar. Only one PitStop runs at a time: a second launch
+(for example a dev binary beside an installed copy) detects the running
+instance via a lock file (`~/.config/pitstop/pitstop.lock`) and exits instead
+of fighting over the live credential files.
+
 ## What's different from the macOS version
 
 Linux stores these credentials differently, which makes the port **simpler**,

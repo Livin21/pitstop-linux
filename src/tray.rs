@@ -246,7 +246,7 @@ impl PitStopTray {
                 submenu("Number from", metric_items),
                 MenuItem::Separator,
                 check(
-                    "Auto-switch when an account runs low".into(),
+                    "Auto-switch when low (Claude, Codex, Gemini)".into(),
                     s.auto_switch_enabled,
                     Action::SetSetting(SettingChange::AutoSwitch(!s.auto_switch_enabled)),
                 ),
@@ -359,7 +359,7 @@ mod tests {
     fn version_line_label_correct() {
         // The disabled menu item always shows the running version.
         let label = format!("PitStop v{}", env!("CARGO_PKG_VERSION"));
-        assert_eq!(label, "PitStop v0.3.1");
+        assert_eq!(label, "PitStop v0.4.1");
     }
 
     #[test]
